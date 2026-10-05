@@ -2,23 +2,35 @@ package executor
 
 import (
 	"context"
+	"maps"
+	"strconv"
 	"strings"
 	"time"
 
-	codexauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	codexauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
 
 func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	log.Debugf("codex executor: refresh called")
-	if refreshed, handled, err := helps.RefreshAuthViaHome(ctx, e.cfg, auth); handled {
-		return refreshed, err
-	}
 	if auth == nil {
 		return nil, statusErr{code: 500, msg: "codex executor: auth is nil"}
+	}
+	if refreshed, handled, err := helps.RefreshAuthViaHome(ctx, e.cfg, auth); handled {
+		if err != nil {
+			return nil, err
+		}
+		if refreshed == nil {
+			return nil, statusErr{code: 500, msg: "codex executor: home refresh returned nil auth"}
+		}
+		if errKeyring := updateCodexResponsesCompactionStorageFromHome(auth, refreshed); errKeyring != nil {
+			return nil, errKeyring
+		}
+		return refreshed, nil
 	}
 	var refreshToken string
 	if auth.Metadata != nil {
@@ -34,24 +46,153 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if err != nil {
 		return nil, err
 	}
-	if auth.Metadata == nil {
-		auth.Metadata = make(map[string]any)
+	metadata := maps.Clone(auth.Metadata)
+	if metadata == nil {
+		metadata = make(map[string]any)
 	}
-	auth.Metadata["id_token"] = td.IDToken
-	auth.Metadata["access_token"] = td.AccessToken
+	metadata["id_token"] = td.IDToken
+	metadata["access_token"] = td.AccessToken
 	if td.RefreshToken != "" {
-		auth.Metadata["refresh_token"] = td.RefreshToken
+		metadata["refresh_token"] = td.RefreshToken
 	}
 	if td.AccountID != "" {
-		auth.Metadata["account_id"] = td.AccountID
+		metadata["account_id"] = td.AccountID
+	} else {
+		delete(metadata, "account_id")
 	}
-	auth.Metadata["email"] = td.Email
+	metadata["email"] = td.Email
 	// Use unified key in files
-	auth.Metadata["expired"] = td.Expire
-	auth.Metadata["type"] = "codex"
+	metadata["expired"] = td.Expire
+	metadata["type"] = "codex"
 	now := time.Now().Format(time.RFC3339)
-	auth.Metadata["last_refresh"] = now
+	metadata["last_refresh"] = now
+
+	planType := strings.TrimSpace(td.PlanType)
+	if planType == "" && td.IDToken != "" {
+		if claims, errParse := codexauth.ParseJWTToken(td.IDToken); errParse == nil && claims != nil {
+			planType = claims.GetPlanType()
+		}
+	}
+	if planType == "" {
+		planType = codexauth.DefaultPlanType
+	}
+	metadata["plan_type"] = planType
+	clonedAttributes := make(map[string]string, len(auth.Attributes)+1)
+	for k, v := range auth.Attributes {
+		clonedAttributes[k] = v
+	}
+	clonedAttributes["plan_type"] = planType
+	auth.Attributes = clonedAttributes
+	var storage *codexauth.CodexTokenStorage
+	if currentStorage, ok := auth.Storage.(*codexauth.CodexTokenStorage); ok && currentStorage != nil {
+		clonedStorage := *currentStorage
+		svc.UpdateTokenStorage(&clonedStorage, td)
+		clonedStorage.PlanType = planType
+		storage = &clonedStorage
+	} else {
+		storage = svc.CreateTokenStorage(&codexauth.CodexAuthBundle{TokenData: *td, LastRefresh: now})
+	}
+	if errKeyring := updateCodexResponsesCompactionStorageWithMetadata(auth, td.AccountID, storage, metadata); errKeyring != nil {
+		return nil, errKeyring
+	}
 	return auth, nil
+}
+
+func verifiedCodexAccountID(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	idToken, _ := auth.Metadata["id_token"].(string)
+	if idToken == "" {
+		if storage, ok := auth.Storage.(*codexauth.CodexTokenStorage); ok && storage != nil {
+			idToken = storage.IDToken
+		}
+	}
+	claims, err := codexauth.ParseJWTToken(idToken)
+	if err != nil || claims == nil {
+		return ""
+	}
+	return strings.TrimSpace(claims.GetAccountID())
+}
+
+func updateCodexResponsesCompactionStorage(auth *cliproxyauth.Auth, accountID string, storage *codexauth.CodexTokenStorage) error {
+	if auth == nil {
+		return statusErr{code: 500, msg: "codex executor: auth is nil"}
+	}
+	return updateCodexResponsesCompactionStorageWithMetadata(auth, accountID, storage, maps.Clone(auth.Metadata))
+}
+
+func updateCodexResponsesCompactionStorageFromHome(previousAuth, refreshedAuth *cliproxyauth.Auth) error {
+	if refreshedAuth == nil {
+		return statusErr{code: 500, msg: "codex executor: home refresh returned nil auth"}
+	}
+	accountID := verifiedCodexAccountID(refreshedAuth)
+	var previousKeyring *codexauth.ResponsesCompactionKeyring
+	if previousAuth != nil && previousAuth.ID != "" && previousAuth.ID == refreshedAuth.ID && previousAuth.Provider == "codex" && refreshedAuth.Provider == "codex" {
+		if storage, ok := previousAuth.Storage.(*codexauth.CodexTokenStorage); ok && storage != nil {
+			previousKeyring = storage.ResponsesCompactionKeyring
+		}
+		if previousKeyring == nil {
+			previousKeyring, _ = codexauth.ResponsesCompactionKeyringFromValue(previousAuth.Metadata[codexauth.ResponsesCompactionKeyringMetadataKey])
+		}
+		previousAccountID := verifiedCodexAccountID(previousAuth)
+		if previousAccountID != accountID || previousKeyring == nil || !previousKeyring.ValidForAccount(previousAccountID) {
+			previousKeyring = nil
+		}
+	}
+	metadata := maps.Clone(refreshedAuth.Metadata)
+	delete(metadata, codexauth.ResponsesCompactionKeyringMetadataKey)
+	refreshedAuth.Storage = nil
+	return updateCodexResponsesCompactionStorageWithMetadataAndPrevious(refreshedAuth, accountID, nil, metadata, previousKeyring)
+}
+
+func updateCodexResponsesCompactionStorageWithMetadata(auth *cliproxyauth.Auth, accountID string, storage *codexauth.CodexTokenStorage, metadata map[string]any) error {
+	return updateCodexResponsesCompactionStorageWithMetadataAndPrevious(auth, accountID, storage, metadata, nil)
+}
+
+func updateCodexResponsesCompactionStorageWithMetadataAndPrevious(auth *cliproxyauth.Auth, accountID string, storage *codexauth.CodexTokenStorage, metadata map[string]any, previousKeyring *codexauth.ResponsesCompactionKeyring) error {
+	if auth == nil {
+		return statusErr{code: 500, msg: "codex executor: auth is nil"}
+	}
+	if metadata == nil {
+		metadata = make(map[string]any)
+	}
+	var previous *codexauth.ResponsesCompactionKeyring
+	if current, ok := auth.Storage.(*codexauth.CodexTokenStorage); ok && current != nil {
+		previous = current.ResponsesCompactionKeyring
+	}
+	if previous == nil {
+		previous, _ = codexauth.ResponsesCompactionKeyringFromValue(metadata[codexauth.ResponsesCompactionKeyringMetadataKey])
+	}
+	if previous == nil {
+		previous = previousKeyring
+	}
+	delete(metadata, codexauth.ResponsesCompactionKeyringMetadataKey)
+	accountID = strings.TrimSpace(accountID)
+	var keyring *codexauth.ResponsesCompactionKeyring
+	if accountID != "" {
+		if previous != nil && previous.ValidForAccount(accountID) {
+			keyring = previous
+		} else {
+			var err error
+			keyring, err = codexauth.NewResponsesCompactionKeyring(accountID)
+			if err != nil {
+				return err
+			}
+		}
+		metadata["account_id"] = accountID
+	} else {
+		delete(metadata, "account_id")
+	}
+	if storage == nil {
+		storage = codexauth.NewTokenStorageFromMetadata(metadata)
+	}
+	storage.AccountID = accountID
+	storage.ResponsesCompactionKeyring = keyring
+	storage.SetMetadata(metadata)
+	auth.Metadata = metadata
+	auth.Storage = storage
+	return nil
 }
 
 func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
@@ -71,16 +212,31 @@ func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 }
 
 func (e *CodexExecutor) resolveCodexConfig(auth *cliproxyauth.Auth) *config.CodexKey {
-	if auth == nil || e.cfg == nil {
+	if e == nil {
+		return nil
+	}
+	return resolveCodexKeyConfig(e.cfg, auth)
+}
+
+func resolveCodexKeyConfig(cfg *config.Config, auth *cliproxyauth.Auth) *config.CodexKey {
+	if auth == nil || cfg == nil {
 		return nil
 	}
 	var attrKey, attrBase string
 	if auth.Attributes != nil {
 		attrKey = strings.TrimSpace(auth.Attributes["api_key"])
 		attrBase = strings.TrimSpace(auth.Attributes["base_url"])
+		if index, errIndex := strconv.Atoi(strings.TrimSpace(auth.Attributes[cliproxyauth.AttributeConfigIndex])); errIndex == nil && index >= 0 && index < len(cfg.CodexKey) {
+			entry := &cfg.CodexKey[index]
+			cfgKey := strings.TrimSpace(entry.APIKey)
+			cfgBase := strings.TrimSpace(entry.BaseURL)
+			if (attrKey == "" || strings.EqualFold(cfgKey, attrKey)) && (attrBase == "" || strings.EqualFold(cfgBase, attrBase)) {
+				return entry
+			}
+		}
 	}
-	for i := range e.cfg.CodexKey {
-		entry := &e.cfg.CodexKey[i]
+	for i := range cfg.CodexKey {
+		entry := &cfg.CodexKey[i]
 		cfgKey := strings.TrimSpace(entry.APIKey)
 		cfgBase := strings.TrimSpace(entry.BaseURL)
 		if attrKey != "" && attrBase != "" {
@@ -99,12 +255,36 @@ func (e *CodexExecutor) resolveCodexConfig(auth *cliproxyauth.Auth) *config.Code
 		}
 	}
 	if attrKey != "" {
-		for i := range e.cfg.CodexKey {
-			entry := &e.cfg.CodexKey[i]
+		for i := range cfg.CodexKey {
+			entry := &cfg.CodexKey[i]
 			if strings.EqualFold(strings.TrimSpace(entry.APIKey), attrKey) {
 				return entry
 			}
 		}
 	}
 	return nil
+}
+
+func (e *CodexExecutor) resolveCodexModelIsCompat(auth *cliproxyauth.Auth, req cliproxyexecutor.Request, baseModel string) bool {
+	if modelInfo, ok := cliproxyauth.ResolvedModelInfo(req); ok && modelInfo != nil {
+		return modelInfo.IsCompat
+	}
+	entry := e.resolveCodexConfig(auth)
+	if entry != nil && len(entry.Models) > 0 {
+		requested := strings.TrimSpace(req.Model)
+		target := strings.TrimSpace(baseModel)
+		for i := range entry.Models {
+			name := strings.TrimSpace(entry.Models[i].Name)
+			alias := strings.TrimSpace(entry.Models[i].Alias)
+			if (target != "" && (strings.EqualFold(name, target) || strings.EqualFold(alias, target))) ||
+				(requested != "" && (strings.EqualFold(name, requested) || strings.EqualFold(alias, requested))) {
+				return entry.Models[i].IsCompat
+			}
+		}
+		return false
+	}
+	if cliproxyauth.CodexAPIKeyModelIsCompat(e.cfg, auth, baseModel) || cliproxyauth.CodexAPIKeyModelIsCompat(e.cfg, auth, req.Model) {
+		return true
+	}
+	return false
 }

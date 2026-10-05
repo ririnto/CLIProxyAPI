@@ -13,11 +13,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/browser"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/browser"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -259,22 +259,44 @@ func (a *CodexAuthenticator) buildAuthRecord(authSvc *codex.CodexAuth, authBundl
 	}
 
 	planType := ""
+	if tokenStorage.PlanType != "" {
+		planType = tokenStorage.PlanType
+	}
 	hashAccountID := ""
+	accountID := ""
 	if tokenStorage.IDToken != "" {
 		if claims, errParse := codex.ParseJWTToken(tokenStorage.IDToken); errParse == nil && claims != nil {
-			planType = strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType)
-			accountID := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
+			if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
+				planType = pt
+			}
+			accountID = strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID)
 			if accountID != "" {
 				digest := sha256.Sum256([]byte(accountID))
 				hashAccountID = hex.EncodeToString(digest[:])[:8]
 			}
 		}
 	}
+	tokenStorage.AccountID = accountID
+	if accountID == "" {
+		tokenStorage.ResponsesCompactionKeyring = nil
+	} else if tokenStorage.ResponsesCompactionKeyring == nil || !tokenStorage.ResponsesCompactionKeyring.ValidForAccount(accountID) {
+		keyring, errKeyring := codex.NewResponsesCompactionKeyring(accountID)
+		if errKeyring != nil {
+			return nil, errKeyring
+		}
+		tokenStorage.ResponsesCompactionKeyring = keyring
+	}
+	if planType == "" {
+		planType = codex.DefaultPlanType
+	}
+	tokenStorage.PlanType = planType
 
 	fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
 	metadata := map[string]any{
-		"email": tokenStorage.Email,
+		"email":     tokenStorage.Email,
+		"plan_type": planType,
 	}
+	tokenStorage.SetMetadata(metadata)
 
 	fmt.Println("Codex authentication successful")
 	if authBundle.APIKey != "" {
