@@ -70,6 +70,9 @@ func TestMethodNamesAreStable(t *testing.T) {
 	if MethodHostHTTPDo != "host.http.do" {
 		t.Fatalf("MethodHostHTTPDo = %q", MethodHostHTTPDo)
 	}
+	if MethodHostHTTPDoBounded != "host.http.do_bounded" {
+		t.Fatalf("MethodHostHTTPDoBounded = %q", MethodHostHTTPDoBounded)
+	}
 	if MethodHostHTTPDoStream != "host.http.do_stream" {
 		t.Fatalf("MethodHostHTTPDoStream = %q", MethodHostHTTPDoStream)
 	}

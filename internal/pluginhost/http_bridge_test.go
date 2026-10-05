@@ -66,6 +66,74 @@ func TestHostHTTPClientMarksUpstreamAttempt(t *testing.T) {
 	}
 }
 
+func TestHostHTTPClientDirectRequestUsesFreshProxyFreeTransport(t *testing.T) {
+	var proxyRequests atomic.Int32
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proxyRequests.Add(1)
+		_, _ = io.WriteString(w, "proxy")
+	}))
+	t.Cleanup(proxyServer.Close)
+	var originRequests atomic.Int32
+	originServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		originRequests.Add(1)
+		_, _ = io.WriteString(w, "origin")
+	}))
+	t.Cleanup(originServer.Close)
+	host := New()
+	host.mu.Lock()
+	host.runtimeConfig = &config.Config{SDKConfig: config.SDKConfig{ProxyURL: proxyServer.URL}}
+	host.mu.Unlock()
+	client := host.newHTTPClient(nil)
+	response, errDo := client.Do(context.Background(), pluginapi.HTTPRequest{Method: http.MethodGet, URL: originServer.URL, Direct: true})
+	if errDo != nil || response.StatusCode != http.StatusOK || string(response.Body) != "origin" {
+		t.Fatalf("direct response = (%+v, %v), want origin response", response, errDo)
+	}
+	if originRequests.Load() != 1 || proxyRequests.Load() != 0 {
+		t.Fatalf("after direct request: origin=%d proxy=%d", originRequests.Load(), proxyRequests.Load())
+	}
+	response, errDo = client.Do(context.Background(), pluginapi.HTTPRequest{Method: http.MethodGet, URL: originServer.URL})
+	if errDo != nil || string(response.Body) != "proxy" {
+		t.Fatalf("default response after direct request = (%+v, %v), want configured proxy", response, errDo)
+	}
+	if proxyRequests.Load() != 1 {
+		t.Fatalf("configured proxy requests = %d, want one", proxyRequests.Load())
+	}
+}
+
+func TestHostHTTPClientDisableRedirectsAndBoundsResponseBody(t *testing.T) {
+	var redirectTargetRequests atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirectTargetRequests.Add(1)
+		_, _ = io.WriteString(w, "target")
+	}))
+	t.Cleanup(target.Close)
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	t.Cleanup(redirect.Close)
+	client := New().newHTTPClient(nil)
+	response, errDo := client.Do(context.Background(), pluginapi.HTTPRequest{
+		Method:           http.MethodGet,
+		URL:              redirect.URL,
+		Direct:           true,
+		DisableRedirects: true,
+		MaxResponseBytes: 1024,
+	})
+	if errDo != nil || response.StatusCode != http.StatusFound {
+		t.Fatalf("redirect response = (%+v, %v), want un-followed 302", response, errDo)
+	}
+	if redirectTargetRequests.Load() != 0 {
+		t.Fatalf("redirect target requests = %d, want zero", redirectTargetRequests.Load())
+	}
+	oversized := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "123456")
+	}))
+	t.Cleanup(oversized.Close)
+	if _, errDo := client.Do(context.Background(), pluginapi.HTTPRequest{Method: http.MethodGet, URL: oversized.URL, Direct: true, MaxResponseBytes: 5}); errDo == nil {
+		t.Fatal("oversized response succeeded")
+	}
+}
+
 func TestHostHTTPClientAppliesWireProfile(t *testing.T) {
 	t.Parallel()
 

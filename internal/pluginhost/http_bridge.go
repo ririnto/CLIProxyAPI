@@ -34,6 +34,8 @@ type hostHTTPClient struct {
 	requestProxyURL string
 }
 
+const maxBoundedHostHTTPResponseBytes = int64(64 << 20)
+
 func (h *Host) newHTTPClient(auth *coreauth.Auth, providers ...string) pluginapi.HostHTTPClient {
 	return h.newHTTPClientWithProxy(auth, "", providers...)
 }
@@ -62,6 +64,9 @@ func (c *hostHTTPClient) Do(ctx context.Context, req pluginapi.HTTPRequest) (plu
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if req.MaxResponseBytes < 0 || req.MaxResponseBytes > maxBoundedHostHTTPResponseBytes {
+		return pluginapi.HTTPResponse{}, fmt.Errorf("host http response limit is invalid")
+	}
 	resp, cfg, cleanup, errDo := c.doHTTP(ctx, req)
 	if errDo != nil {
 		return pluginapi.HTTPResponse{}, errDo
@@ -75,7 +80,7 @@ func (c *hostHTTPClient) Do(ctx context.Context, req pluginapi.HTTPRequest) (plu
 		}
 	}()
 	helps.RecordAPIResponseMetadata(ctx, cfg, resp.StatusCode, resp.Header.Clone())
-	body, errReadAll := io.ReadAll(resp.Body)
+	body, errReadAll := readHostHTTPResponseBody(resp.Body, req.MaxResponseBytes)
 	if len(body) > 0 {
 		helps.AppendAPIResponseChunk(ctx, cfg, body)
 	}
@@ -93,6 +98,9 @@ func (c *hostHTTPClient) Do(ctx context.Context, req pluginapi.HTTPRequest) (plu
 func (c *hostHTTPClient) DoStream(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if req.MaxResponseBytes != 0 {
+		return pluginapi.HTTPStreamResponse{}, fmt.Errorf("host http response limits are not supported for streams")
 	}
 	resp, cfg, cleanup, errDo := c.doHTTP(ctx, req)
 	if errDo != nil {
@@ -141,12 +149,29 @@ func (c *hostHTTPClient) DoStream(ctx context.Context, req pluginapi.HTTPRequest
 	}, nil
 }
 
+func readHostHTTPResponseBody(body io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes == 0 {
+		return io.ReadAll(body)
+	}
+	limited, errRead := io.ReadAll(io.LimitReader(body, maxBytes+1))
+	if errRead != nil {
+		return nil, errRead
+	}
+	if int64(len(limited)) > maxBytes {
+		return nil, fmt.Errorf("host http response exceeds the configured limit")
+	}
+	return limited, nil
+}
+
 func (c *hostHTTPClient) doHTTP(ctx context.Context, req pluginapi.HTTPRequest) (*http.Response, *config.Config, func(), error) {
 	if c == nil || c.host == nil {
 		return nil, nil, nil, fmt.Errorf("host http client is unavailable")
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if req.MaxResponseBytes < 0 || req.MaxResponseBytes > maxBoundedHostHTTPResponseBytes {
+		return nil, nil, nil, fmt.Errorf("host http response limit is invalid")
 	}
 	cfg := c.host.currentRuntimeConfig()
 	method := req.Method
@@ -217,11 +242,25 @@ func (h *Host) currentRuntimeConfig() *config.Config {
 func (c *hostHTTPClient) newHTTPClientForRequest(ctx context.Context, cfg *config.Config, req pluginapi.HTTPRequest, httpReq *http.Request) (*http.Client, func(), error) {
 	profile := req.WireProfile
 	if profile == nil || (!profile.HTTP1Only && !profile.DisableAutoCompression && len(profile.HeaderProfile) == 0) {
-		client := helps.NewProxyAwareHTTPClient(c.proxyContext(ctx), cfg, c.auth, 0)
-		if client == nil {
-			client = &http.Client{}
+		var client *http.Client
+		var cleanup func()
+		if req.Direct {
+			transport := proxyutil.NewDirectTransport()
+			client = &http.Client{Transport: transport}
+			cleanup = transport.CloseIdleConnections
+		} else {
+			client = helps.NewProxyAwareHTTPClient(c.proxyContext(ctx), cfg, c.auth, 0)
+			if client == nil {
+				client = &http.Client{}
+			}
 		}
-		return client, nil, nil
+		clientCopy := *client
+		if req.DisableRedirects {
+			clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			}
+		}
+		return &clientCopy, cleanup, nil
 	}
 
 	// Priority: request override, then auth proxy, then config proxy.
@@ -237,7 +276,10 @@ func (c *hostHTTPClient) newHTTPClientForRequest(ctx context.Context, cfg *confi
 	var explicitDirect bool
 	var isConfiguredSOCKS bool
 	var builtByProxyutil bool
-	if proxyStr != "" {
+	if req.Direct {
+		explicitDirect = true
+		baseTransport = proxyutil.NewDirectTransport()
+	} else if proxyStr != "" {
 		setting, errParse := proxyutil.Parse(proxyStr)
 		if errParse != nil {
 			return nil, nil, fmt.Errorf("pluginhost: parse proxy %s: %w", proxyutil.Redact(proxyStr), errParse)
@@ -263,7 +305,7 @@ func (c *hostHTTPClient) newHTTPClientForRequest(ctx context.Context, cfg *confi
 	}
 
 	var ctxTransport *http.Transport
-	if ctx != nil {
+	if !req.Direct && ctx != nil {
 		if ctxRoundTripper, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && ctxRoundTripper != nil {
 			if t, ok := ctxRoundTripper.(*http.Transport); ok && t != nil {
 				ctxTransport = t
@@ -378,6 +420,9 @@ func (c *hostHTTPClient) newHTTPClientForRequest(ctx context.Context, cfg *confi
 			}).DialContext
 		}
 		origProxyFunc := baseTransport.Proxy
+		if req.Direct {
+			origProxyFunc = nil
+		}
 
 		// For plain HTTP requests, wrapping DialContext intercepts the plaintext HTTP request bytes.
 		// Handshake bytes (like SOCKS5 or direct writes) are bypassed cleanly by NewOrderedRequestConn.
@@ -404,7 +449,11 @@ func (c *hostHTTPClient) newHTTPClientForRequest(ctx context.Context, cfg *confi
 
 		baseTransport.DialTLSContext = func(dialCtx context.Context, network, addr string) (net.Conn, error) {
 			currentReq := reqHolder.get()
-			targetProxy, errProxy := resolveProxyForRequest(currentReq, c.auth, cfg, origProxyFunc)
+			var targetProxy *url.URL
+			var errProxy error
+			if !req.Direct {
+				targetProxy, errProxy = resolveProxyForRequest(currentReq, c.auth, cfg, origProxyFunc)
+			}
 			if errProxy != nil {
 				return nil, errProxy
 			}
@@ -512,6 +561,9 @@ func (c *hostHTTPClient) newHTTPClientForRequest(ctx context.Context, cfg *confi
 	client := &http.Client{
 		Transport: baseTransport,
 		CheckRedirect: func(redirectReq *http.Request, via []*http.Request) error {
+			if req.DisableRedirects {
+				return http.ErrUseLastResponse
+			}
 			reqHolder.set(redirectReq)
 			baseTransport.CloseIdleConnections()
 			if len(via) >= 10 {

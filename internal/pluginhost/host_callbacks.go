@@ -19,25 +19,31 @@ import (
 )
 
 type rpcHostHTTPRequest struct {
-	HTTPClientID   string                     `json:"http_client_id,omitempty"`
-	HostCallbackID string                     `json:"host_callback_id,omitempty"`
-	OperationID    string                     `json:"operation_id,omitempty"`
-	Method         string                     `json:"method,omitempty"`
-	URL            string                     `json:"url,omitempty"`
-	Headers        httpHeader                 `json:"headers,omitempty"`
-	Body           []byte                     `json:"body,omitempty"`
-	WireProfile    *pluginapi.HTTPWireProfile `json:"wire_profile,omitempty"`
-	Request        *httpRequest               `json:"request,omitempty"`
+	HTTPClientID     string                     `json:"http_client_id,omitempty"`
+	HostCallbackID   string                     `json:"host_callback_id,omitempty"`
+	OperationID      string                     `json:"operation_id,omitempty"`
+	Method           string                     `json:"method,omitempty"`
+	URL              string                     `json:"url,omitempty"`
+	Headers          httpHeader                 `json:"headers,omitempty"`
+	Body             []byte                     `json:"body,omitempty"`
+	WireProfile      *pluginapi.HTTPWireProfile `json:"wire_profile,omitempty"`
+	Direct           bool                       `json:"direct,omitempty"`
+	DisableRedirects bool                       `json:"disable_redirects,omitempty"`
+	MaxResponseBytes int64                      `json:"max_response_bytes,omitempty"`
+	Request          *httpRequest               `json:"request,omitempty"`
 }
 
 type httpHeader map[string][]string
 
 type httpRequest struct {
-	Method      string                     `json:"method,omitempty"`
-	URL         string                     `json:"url,omitempty"`
-	Headers     httpHeader                 `json:"headers,omitempty"`
-	Body        []byte                     `json:"body,omitempty"`
-	WireProfile *pluginapi.HTTPWireProfile `json:"wire_profile,omitempty"`
+	Method           string                     `json:"method,omitempty"`
+	URL              string                     `json:"url,omitempty"`
+	Headers          httpHeader                 `json:"headers,omitempty"`
+	Body             []byte                     `json:"body,omitempty"`
+	WireProfile      *pluginapi.HTTPWireProfile `json:"wire_profile,omitempty"`
+	Direct           bool                       `json:"direct,omitempty"`
+	DisableRedirects bool                       `json:"disable_redirects,omitempty"`
+	MaxResponseBytes int64                      `json:"max_response_bytes,omitempty"`
 }
 
 type rpcHostHTTPStreamResponse struct {
@@ -155,6 +161,8 @@ func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte
 		return h.callHostModelStreamClose(request)
 	case pluginabi.MethodHostHTTPDo:
 		return h.callHostHTTPDo(ctx, request)
+	case pluginabi.MethodHostHTTPDoBounded:
+		return h.callHostHTTPDoBounded(ctx, request)
 	case pluginabi.MethodHostHTTPDoStream:
 		return h.callHostHTTPDoStream(ctx, request)
 	case pluginabi.MethodHostHTTPOperationOpen:
@@ -196,9 +204,20 @@ func (h *Host) callbackCallerPluginID(ctx context.Context, callbackID string) st
 }
 
 func (h *Host) callHostHTTPDo(ctx context.Context, request []byte) ([]byte, error) {
+	return h.callHostHTTP(ctx, request, false)
+}
+
+func (h *Host) callHostHTTPDoBounded(ctx context.Context, request []byte) ([]byte, error) {
+	return h.callHostHTTP(ctx, request, true)
+}
+
+func (h *Host) callHostHTTP(ctx context.Context, request []byte, bounded bool) ([]byte, error) {
 	httpReq, callbackID, operationID, errDecode := decodeHostHTTPRequestWithOperationID(request)
 	if errDecode != nil {
 		return nil, errDecode
+	}
+	if bounded && (!httpReq.Direct || !httpReq.DisableRedirects || httpReq.MaxResponseBytes <= 0) {
+		return nil, fmt.Errorf("bounded host HTTP request requires direct transport, disabled redirects, and a positive response limit")
 	}
 	operation, errAcquire := h.acquireHostHTTPOperation(ctx, callbackID, operationID)
 	if errAcquire != nil {
@@ -355,19 +374,25 @@ func decodeHostHTTPRequestWithOperationID(raw []byte) (pluginapi.HTTPRequest, st
 			wireProfile = req.WireProfile
 		}
 		return pluginapi.HTTPRequest{
-			Method:      req.Request.Method,
-			URL:         req.Request.URL,
-			Headers:     map[string][]string(req.Request.Headers),
-			Body:        append([]byte(nil), req.Request.Body...),
-			WireProfile: cloneWireProfile(wireProfile),
+			Method:           req.Request.Method,
+			URL:              req.Request.URL,
+			Headers:          map[string][]string(req.Request.Headers),
+			Body:             append([]byte(nil), req.Request.Body...),
+			WireProfile:      cloneWireProfile(wireProfile),
+			Direct:           req.Request.Direct,
+			DisableRedirects: req.Request.DisableRedirects,
+			MaxResponseBytes: req.Request.MaxResponseBytes,
 		}, req.HostCallbackID, strings.TrimSpace(req.OperationID), nil
 	}
 	return pluginapi.HTTPRequest{
-		Method:      req.Method,
-		URL:         req.URL,
-		Headers:     map[string][]string(req.Headers),
-		Body:        append([]byte(nil), req.Body...),
-		WireProfile: cloneWireProfile(req.WireProfile),
+		Method:           req.Method,
+		URL:              req.URL,
+		Headers:          map[string][]string(req.Headers),
+		Body:             append([]byte(nil), req.Body...),
+		WireProfile:      cloneWireProfile(req.WireProfile),
+		Direct:           req.Direct,
+		DisableRedirects: req.DisableRedirects,
+		MaxResponseBytes: req.MaxResponseBytes,
 	}, req.HostCallbackID, strings.TrimSpace(req.OperationID), nil
 }
 

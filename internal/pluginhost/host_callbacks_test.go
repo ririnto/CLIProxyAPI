@@ -470,6 +470,101 @@ func TestHostHTTPDoWithoutOperationIDIsCanceledWithPluginInstance(t *testing.T) 
 	}
 }
 
+func TestHostHTTPDoBoundedRequiresStrictRequestOptions(t *testing.T) {
+	for _, request := range []rpcHostHTTPRequest{
+		{Method: http.MethodGet, URL: "http://127.0.0.1/v1/models", MaxResponseBytes: 10, DisableRedirects: true},
+		{Method: http.MethodGet, URL: "http://127.0.0.1/v1/models", MaxResponseBytes: 10, Direct: true},
+		{Method: http.MethodGet, URL: "http://127.0.0.1/v1/models", Direct: true, DisableRedirects: true},
+	} {
+		rawRequest, errMarshal := json.Marshal(request)
+		if errMarshal != nil {
+			t.Fatalf("marshal bounded request: %v", errMarshal)
+		}
+		if _, errCall := New().callFromPlugin(context.Background(), pluginabi.MethodHostHTTPDoBounded, rawRequest); errCall == nil {
+			t.Fatalf("bounded request without required options succeeded: %+v", request)
+		}
+	}
+}
+
+func TestHostHTTPDoBoundedCancelsHeadersBodyAndPluginShutdown(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		writeHeaders bool
+		shutdown     bool
+	}{
+		{name: "request cancellation before headers"},
+		{name: "request cancellation while reading body", writeHeaders: true},
+		{name: "plugin shutdown while reading body", writeHeaders: true, shutdown: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			requestStarted := make(chan struct{})
+			requestCanceled := make(chan struct{})
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if testCase.writeHeaders {
+					w.WriteHeader(http.StatusOK)
+					w.(http.Flusher).Flush()
+				}
+				close(requestStarted)
+				select {
+				case <-r.Context().Done():
+					close(requestCanceled)
+				case <-release:
+				}
+			}))
+			defer server.Close()
+			defer close(release)
+
+			parent, cancelParent := context.WithCancel(context.Background())
+			defer cancelParent()
+			host := New()
+			instance := &hostCallbackInstance{}
+			callbackID, closeCallback := host.openCallbackContextForPluginInstance(parent, "catalog", instance)
+			defer closeCallback()
+			rawRequest, errMarshal := json.Marshal(rpcHostHTTPRequest{
+				HostCallbackID:   callbackID,
+				Method:           http.MethodGet,
+				URL:              server.URL,
+				Direct:           true,
+				DisableRedirects: true,
+				MaxResponseBytes: 1024,
+			})
+			if errMarshal != nil {
+				t.Fatalf("marshal bounded request: %v", errMarshal)
+			}
+			done := make(chan error, 1)
+			callerContext := withHostCallbackIdentity(context.Background(), "catalog", instance)
+			go func() {
+				_, errCall := host.callFromPlugin(callerContext, pluginabi.MethodHostHTTPDoBounded, rawRequest)
+				done <- errCall
+			}()
+			select {
+			case <-requestStarted:
+			case <-time.After(2 * time.Second):
+				t.Fatal("bounded upstream request did not start")
+			}
+			if testCase.shutdown {
+				host.closeHostHTTPPluginResources("catalog", instance)
+			} else {
+				cancelParent()
+			}
+			select {
+			case <-requestCanceled:
+			case <-time.After(2 * time.Second):
+				t.Fatal("bounded upstream request was not canceled")
+			}
+			select {
+			case errCall := <-done:
+				if !errors.Is(errCall, context.Canceled) {
+					t.Fatalf("bounded callback error = %v, want context.Canceled", errCall)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("bounded host callback did not return after cancellation")
+			}
+		})
+	}
+}
+
 func TestHostHTTPDoCanBeCanceledWhileReadingBody(t *testing.T) {
 	headersSent := make(chan struct{})
 	requestCanceled := make(chan struct{})

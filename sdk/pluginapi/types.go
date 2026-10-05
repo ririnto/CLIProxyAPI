@@ -920,6 +920,12 @@ type HTTPRequest struct {
 	Body []byte
 	// WireProfile specifies optional outbound HTTP wire profile settings.
 	WireProfile *HTTPWireProfile `json:"wire_profile,omitempty"`
+	// Direct bypasses configured and environment HTTP proxies.
+	Direct bool `json:"direct,omitempty"`
+	// DisableRedirects returns redirect responses without following them.
+	DisableRedirects bool `json:"disable_redirects,omitempty"`
+	// MaxResponseBytes limits the body returned by Do. Zero keeps the default behavior.
+	MaxResponseBytes int64 `json:"max_response_bytes,omitempty"`
 }
 
 // HTTPResponse describes a non-streaming host HTTP response.

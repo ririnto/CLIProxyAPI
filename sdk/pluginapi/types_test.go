@@ -54,6 +54,20 @@ func TestMetadataConfigFieldsExposePluginSchema(t *testing.T) {
 	}
 }
 
+func TestHTTPRequestBoundedOptionsUseStableJSONNames(t *testing.T) {
+	raw, err := json.Marshal(HTTPRequest{Direct: true, DisableRedirects: true, MaxResponseBytes: 1024})
+	if err != nil {
+		t.Fatalf("marshal bounded HTTP request: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal bounded HTTP request: %v", err)
+	}
+	if got["direct"] != true || got["disable_redirects"] != true || got["max_response_bytes"] != float64(1024) {
+		t.Fatalf("bounded HTTP request fields = %#v", got)
+	}
+}
+
 func TestAuthParseResponseSupportsMultipleAuths(t *testing.T) {
 	resp := AuthParseResponse{
 		Handled: true,

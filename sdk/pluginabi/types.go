@@ -93,6 +93,7 @@ const (
 	MethodQuotaReset      = "quota.reset"
 
 	MethodHostHTTPDo             = "host.http.do"
+	MethodHostHTTPDoBounded      = "host.http.do_bounded"
 	MethodHostHTTPDoStream       = "host.http.do_stream"
 	MethodHostHTTPOperationOpen  = "host.http.operation_open"
 	MethodHostHTTPCancel         = "host.http.cancel"
