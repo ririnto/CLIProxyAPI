@@ -189,8 +189,10 @@ func (e *OpenAICompatExecutor) openV1Responses(ctx context.Context, auth *clipro
 		summaryCompaction = trigger && helps.IsPreparedV1CompactionPayload(body)
 	}
 	if summaryCompaction {
-		if errValidate := helps.ValidateV1CompactionContext(ctx, body); errValidate != nil {
-			return nil, nil, errValidate
+		for _, payload := range [][]byte{originalPayload, requestPayload, body} {
+			if errValidate := helps.ValidateV1CompactionContext(ctx, payload); errValidate != nil {
+				return nil, nil, errValidate
+			}
 		}
 	}
 	reporter.SetTranslatedReasoningEffort(body, to.String())

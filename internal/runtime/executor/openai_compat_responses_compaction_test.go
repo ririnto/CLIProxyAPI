@@ -849,6 +849,46 @@ func TestOpenAICompatV1ResponsesPayloadRulesRejectUnsafeSummaryHistory(t *testin
 	}
 }
 
+func TestOpenAICompatV1ResponsesPayloadFilterCannotHideSummaryHistory(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			server, capture := newCodexV1CompactionServer(t, func(int) (string, []byte) {
+				return "text/event-stream", codexV1CompactionSSE(codexV1CompactionSummaryResponse())
+			})
+			cfg := &config.Config{
+				OpenAICompatibility: []config.OpenAICompatibility{{Name: "sample", BaseURL: server.URL, Models: []config.OpenAICompatibilityModel{{Name: "summary-model", Alias: "summary-model", UseV1Compaction: true}}}},
+				Payload:             config.PayloadConfig{Filter: []config.PayloadFilterRule{{Models: []config.PayloadModelRule{{Name: "summary-model"}}, Params: []string{"previous_response_id"}}}},
+			}
+			executor := NewOpenAICompatExecutor("sample", cfg)
+			auth := &cliproxyauth.Auth{ID: "filtered-summary-history-test", Provider: "sample", Attributes: map[string]string{"base_url": server.URL, "api_key": "test-secret"}}
+			payload := []byte(`{"previous_response_id":"resp_server_owned","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"only the latest delta"}]},{"type":"compaction_trigger","id":"trigger-final"}]}`)
+			request := cliproxyexecutor.Request{Model: "summary-model", Payload: payload}
+			options := cliproxyexecutor.Options{Stream: stream, SourceFormat: sdktranslator.FormatOpenAIResponse, ResponseFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: payload}
+			finalizePayload := helps.NewPayloadFinalizer(cfg, executor.Identifier(), "summary-model", sdktranslator.FormatOpenAIResponse.String(), "", payload, request, options)
+			preparedBody := helps.SetStringIfDifferent(helps.PrepareV1CompactionPayload(payload), "model", "summary-model")
+			filteredBody := finalizePayload(preparedBody)
+			if gjson.GetBytes(filteredBody, "previous_response_id").Exists() {
+				t.Fatalf("configured payload filter did not remove previous_response_id: %s", filteredBody)
+			}
+			if !helps.IsPreparedV1CompactionPayload(filteredBody) {
+				t.Fatalf("configured payload filter changed the prepared summary mode: %s", filteredBody)
+			}
+			var executionError error
+			if stream {
+				_, executionError = executor.ExecuteStream(context.Background(), auth, request, options)
+			} else {
+				_, executionError = executor.Execute(context.Background(), auth, request, options)
+			}
+			if scoped, ok := executionError.(cliproxyexecutor.RequestScopedError); !ok || !scoped.IsRequestScoped() {
+				t.Fatalf("filtered summary history returned no scoped error: %v", executionError)
+			}
+			if requests := capture.snapshot(); len(requests) != 0 {
+				t.Fatalf("delta-only summary history reached upstream: %+v", requests)
+			}
+		})
+	}
+}
+
 func TestOpenAICompatV1ResponsesFinalPayloadCanDisableSummary(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
