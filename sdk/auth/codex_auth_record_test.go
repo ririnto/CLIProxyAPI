@@ -58,6 +58,9 @@ func TestBuildAuthRecord_PlanTypeDefaultsToFreeWhenMissing(t *testing.T) {
 	if storage.PlanType != "free" {
 		t.Errorf("storage.PlanType = %q, want free", storage.PlanType)
 	}
+	if storage.ResponsesCompactionKeyring == nil || !storage.ResponsesCompactionKeyring.ValidForAccount("acc-12345") {
+		t.Fatal("successful OAuth login did not create a verified-account compaction root")
+	}
 	if !strings.HasSuffix(auth.FileName, "-free.json") {
 		t.Errorf("auth.FileName = %q, want suffix -free.json", auth.FileName)
 	}
@@ -98,5 +101,66 @@ func TestBuildAuthRecord_PlanTypeExtractedWhenPresent(t *testing.T) {
 	}
 	if !strings.HasSuffix(auth.FileName, "-plus.json") {
 		t.Errorf("auth.FileName = %q, want suffix -plus.json", auth.FileName)
+	}
+}
+
+func TestBuildAuthRecordWithoutAccountClaimKeepsOAuthLoginAvailable(t *testing.T) {
+	authenticator := NewCodexAuthenticator()
+	authSvc := codex.NewCodexAuth(nil)
+	bundle := &codex.CodexAuthBundle{TokenData: codex.CodexTokenData{
+		IDToken:      makeTestCodexJWT("plus", ""),
+		AccessToken:  "mock-access-token",
+		RefreshToken: "mock-refresh-token",
+		Email:        "user@example.com",
+	}}
+	authRecord, errBuild := authenticator.buildAuthRecord(authSvc, bundle)
+	if errBuild != nil {
+		t.Fatalf("buildAuthRecord error: %v", errBuild)
+	}
+	storage, ok := authRecord.Storage.(*codex.CodexTokenStorage)
+	if !ok || storage == nil {
+		t.Fatalf("auth storage = %T, want *codex.CodexTokenStorage", authRecord.Storage)
+	}
+	if storage.ResponsesCompactionKeyring != nil {
+		t.Fatal("login without a verified account created a compaction root")
+	}
+	if authRecord.Metadata["account_id"] != nil {
+		t.Fatal("login without a verified account published an account ID")
+	}
+}
+
+func TestBuildAuthRecordCreatesFreshAccountBoundCompactionRoot(t *testing.T) {
+	authenticator := NewCodexAuthenticator()
+	authSvc := codex.NewCodexAuth(nil)
+	bundle := &codex.CodexAuthBundle{TokenData: codex.CodexTokenData{
+		IDToken:     makeTestCodexJWT("plus", "account-a"),
+		AccessToken: "mock-access-token",
+		Email:       "user@example.com",
+	}}
+	first, errFirst := authenticator.buildAuthRecord(authSvc, bundle)
+	if errFirst != nil {
+		t.Fatal(errFirst)
+	}
+	second, errSecond := authenticator.buildAuthRecord(authSvc, bundle)
+	if errSecond != nil {
+		t.Fatal(errSecond)
+	}
+	firstStorage := first.Storage.(*codex.CodexTokenStorage)
+	secondStorage := second.Storage.(*codex.CodexTokenStorage)
+	if firstStorage.AccountID != "account-a" || !firstStorage.ResponsesCompactionKeyring.ValidForAccount("account-a") {
+		t.Fatal("login did not create an account-bound compaction root")
+	}
+	if firstStorage.ResponsesCompactionKeyring.RootKey == secondStorage.ResponsesCompactionKeyring.RootKey {
+		t.Fatal("separate login records reused the same compaction root")
+	}
+	if _, exists := first.Metadata[codex.ResponsesCompactionKeyringMetadataKey]; exists {
+		t.Fatal("compaction root was exposed in runtime auth metadata")
+	}
+	serialized, errMarshal := json.Marshal(first)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	if strings.Contains(string(serialized), firstStorage.ResponsesCompactionKeyring.RootKey) {
+		t.Fatal("serialized auth reply exposed its storage-only compaction root")
 	}
 }

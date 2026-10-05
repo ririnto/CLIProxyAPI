@@ -75,3 +75,96 @@ func TestSaveTokenToFile_PreservesCustomMetadata(t *testing.T) {
 		t.Errorf("weight = %v, want 42", saved["weight"])
 	}
 }
+
+func TestResponsesCompactionKeyringIsRandomAndAccountBound(t *testing.T) {
+	first, errFirst := NewResponsesCompactionKeyring("account-a")
+	if errFirst != nil {
+		t.Fatal(errFirst)
+	}
+	second, errSecond := NewResponsesCompactionKeyring("account-a")
+	if errSecond != nil {
+		t.Fatal(errSecond)
+	}
+	if !first.ValidForAccount("account-a") || first.ValidForAccount("account-b") {
+		t.Fatal("keyring account binding is invalid")
+	}
+	if first.RootKey == second.RootKey {
+		t.Fatal("separate logins reused the same random root")
+	}
+	unsupported := *first
+	unsupported.Version++
+	if unsupported.ValidForAccount("account-a") {
+		t.Fatal("unsupported keyring version was accepted")
+	}
+}
+
+func TestCodexTokenStoragePreservesFreshRootAndHidesMetadataCopy(t *testing.T) {
+	fresh, errFresh := NewResponsesCompactionKeyring("account-a")
+	if errFresh != nil {
+		t.Fatal(errFresh)
+	}
+	old, errOld := NewResponsesCompactionKeyring("account-a")
+	if errOld != nil {
+		t.Fatal(errOld)
+	}
+	storage := &CodexTokenStorage{AccountID: "account-a", ResponsesCompactionKeyring: fresh}
+	metadata := map[string]any{ResponsesCompactionKeyringMetadataKey: old, "prefix": "team"}
+	storage.SetMetadata(metadata)
+	if storage.ResponsesCompactionKeyring.RootKey != fresh.RootKey {
+		t.Fatal("existing metadata replaced the fresh login root")
+	}
+	if _, exists := metadata[ResponsesCompactionKeyringMetadataKey]; exists {
+		t.Fatal("reserved root remained in runtime metadata")
+	}
+	if _, exists := storage.Metadata[ResponsesCompactionKeyringMetadataKey]; exists {
+		t.Fatal("reserved root was copied into token metadata")
+	}
+	storage.AccountID = "account-b"
+	storage.SetMetadata(map[string]any{"prefix": "team"})
+	if storage.ResponsesCompactionKeyring != nil {
+		t.Fatal("foreign-account root survived an account replacement")
+	}
+	foreign, errForeign := NewResponsesCompactionKeyring("account-b")
+	if errForeign != nil {
+		t.Fatal(errForeign)
+	}
+	metadataStorage := &CodexTokenStorage{AccountID: "account-a"}
+	metadataStorage.SetMetadata(map[string]any{ResponsesCompactionKeyringMetadataKey: foreign})
+	if metadataStorage.ResponsesCompactionKeyring != nil {
+		t.Fatal("metadata introduced a keyring bound to another account")
+	}
+}
+
+func TestCodexTokenStorageRoundTripsCompactionKeyringAndUnknownMetadata(t *testing.T) {
+	keyring, errKeyring := NewResponsesCompactionKeyring("account-a")
+	if errKeyring != nil {
+		t.Fatal(errKeyring)
+	}
+	path := filepath.Join(t.TempDir(), "codex.json")
+	storage := &CodexTokenStorage{AccessToken: "access", AccountID: "account-a", ResponsesCompactionKeyring: keyring}
+	storage.SetMetadata(map[string]any{"type": "codex", "account_id": "account-a", "prefix": "team"})
+	if errSave := storage.SaveTokenToFile(path); errSave != nil {
+		t.Fatal(errSave)
+	}
+	raw, errRead := os.ReadFile(path)
+	if errRead != nil {
+		t.Fatal(errRead)
+	}
+	var metadata map[string]any
+	if errDecode := json.Unmarshal(raw, &metadata); errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	reloaded := NewTokenStorageFromMetadata(metadata)
+	if reloaded.ResponsesCompactionKeyring == nil || reloaded.ResponsesCompactionKeyring.RootKey != keyring.RootKey {
+		t.Fatal("persisted root did not survive token-storage reload")
+	}
+	if reloaded.Metadata["prefix"] != "team" {
+		t.Fatal("unknown token metadata did not survive reload")
+	}
+	if _, exists := reloaded.Metadata[ResponsesCompactionKeyringMetadataKey]; exists {
+		t.Fatal("reloaded token metadata exposed the root")
+	}
+	if got := metadata["access_token"]; got != "access" {
+		t.Fatalf("saved access_token = %v, want access", got)
+	}
+}

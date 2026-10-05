@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -18,6 +20,55 @@ func TestNewFileSynthesizer(t *testing.T) {
 	synth := NewFileSynthesizer()
 	if synth == nil {
 		t.Fatal("expected non-nil synthesizer")
+	}
+}
+
+func TestSynthesizeAuthFileKeepsCodexCompactionRootOutOfRuntimeMetadata(t *testing.T) {
+	keyring, errKeyring := codex.NewResponsesCompactionKeyring("account-a")
+	if errKeyring != nil {
+		t.Fatal(errKeyring)
+	}
+	metadata := map[string]any{
+		"type":          "codex",
+		"account_id":    "account-a",
+		"email":         "codex@example.com",
+		"access_token":  "access-token",
+		"refresh_token": "refresh-token",
+		"prefix":        "team",
+		codex.ResponsesCompactionKeyringMetadataKey: keyring,
+	}
+	raw, errMarshal := json.Marshal(metadata)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	path := filepath.Join(t.TempDir(), "codex.json")
+	auths, errSynthesize := SynthesizeAuthFile(&SynthesisContext{Config: &config.Config{}, Now: time.Now()}, path, raw)
+	if errSynthesize != nil {
+		t.Fatal(errSynthesize)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("synthesized auth count = %d, want 1", len(auths))
+	}
+	auth := auths[0]
+	storage, ok := auth.Storage.(*codex.CodexTokenStorage)
+	if !ok || storage == nil || storage.ResponsesCompactionKeyring == nil {
+		t.Fatalf("auth storage did not hydrate the typed compaction root: %#v", auth.Storage)
+	}
+	if storage.ResponsesCompactionKeyring.RootKey != keyring.RootKey {
+		t.Fatal("synthesized auth changed the persisted compaction root")
+	}
+	if _, exists := auth.Metadata[codex.ResponsesCompactionKeyringMetadataKey]; exists {
+		t.Fatal("synthesized auth exposed the compaction root in runtime metadata")
+	}
+	if auth.Metadata["prefix"] != "team" || auth.Metadata["access_token"] != "access-token" {
+		t.Fatal("synthesis dropped ordinary Codex metadata")
+	}
+	serialized, errJSON := json.Marshal(auth)
+	if errJSON != nil {
+		t.Fatal(errJSON)
+	}
+	if strings.Contains(string(serialized), keyring.RootKey) {
+		t.Fatal("serialized auth exposed its storage-only compaction root")
 	}
 }
 

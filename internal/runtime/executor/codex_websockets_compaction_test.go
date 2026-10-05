@@ -294,6 +294,91 @@ collected:
 	}
 }
 
+func TestCodexWebsocketsDuplexV1CompactionReplaysQueuedCapsule(t *testing.T) {
+	requests := make(chan []byte, 2)
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, errUpgrade := upgrader.Upgrade(w, r, nil)
+		if errUpgrade != nil {
+			t.Errorf("upgrade websocket: %v", errUpgrade)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		for turn := 1; turn <= 2; turn++ {
+			_, body, errRead := conn.ReadMessage()
+			if errRead != nil {
+				t.Errorf("read turn %d request: %v", turn, errRead)
+				return
+			}
+			requests <- bytes.Clone(body)
+			responseID := fmt.Sprintf("resp-duplex-%d", turn)
+			if !codexV1WebsocketWrite(t, conn, map[string]any{"type": "response.created", "response": map[string]any{"id": responseID, "output": []any{}}}) {
+				return
+			}
+			if !codexV1WebsocketWrite(t, conn, map[string]any{"type": "response.output_item.done", "sequence_number": 3, "output_index": 0, "response_id": responseID, "item": map[string]any{"type": "message", "id": "msg-duplex", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": "duplex summary"}}}}) {
+				return
+			}
+			if !codexV1WebsocketWrite(t, conn, map[string]any{"type": "response.completed", "sequence_number": 4, "response": map[string]any{"id": responseID, "status": "completed", "model": "summary-model", "output": []any{}, "usage": map[string]any{"input_tokens": 11, "output_tokens": 5, "total_tokens": 16}}}) {
+				return
+			}
+		}
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+	exec := codexV1WebsocketExecutor(server.URL, true, true)
+	auth := codexV1WebsocketAuth(server.URL, "ws-compaction-duplex-replay")
+	input := make(chan cliproxyexecutor.WebsocketInput, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ctx = cliproxyexecutor.WithWebsocketInput(cliproxyexecutor.WithDownstreamWebsocket(ctx), input)
+	opts := codexV1WebsocketOptions()
+	opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: "ws-v1-compaction-duplex-replay-" + t.Name()}
+	stream, errStream := exec.ExecuteStream(ctx, auth, codexV1WebsocketRequest(), opts)
+	if errStream != nil {
+		t.Fatalf("ExecuteStream() error: %v", errStream)
+	}
+	completions, capsuleEvents := 0, 0
+	for chunk := range stream.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("duplex stream error: %v", chunk.Err)
+		}
+		if gjson.GetBytes(chunk.Payload, "type").String() == "response.output_item.done" && gjson.GetBytes(chunk.Payload, "item.type").String() == "compaction" {
+			capsuleEvents++
+		}
+		if gjson.GetBytes(chunk.Payload, "type").String() == "response.completed" {
+			completions++
+			if completions == 1 {
+				capsule := json.RawMessage(gjson.GetBytes(chunk.Payload, "response.output.1").Raw)
+				if gjson.GetBytes(capsule, "type").String() != "compaction" {
+					t.Fatalf("first duplex response omitted capsule: %s", chunk.Payload)
+				}
+				input <- cliproxyexecutor.WebsocketInput{Payload: codexV1WebsocketJSON(t, map[string]any{"type": "response.create", "model": "summary-model", "input": []any{
+					map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "continue"}}},
+					capsule,
+					map[string]any{"type": "compaction_trigger", "id": "trigger-next"},
+				}})}
+			}
+			if completions == 2 {
+				cancel()
+			}
+		}
+	}
+	if completions != 2 || capsuleEvents != 2 {
+		t.Fatalf("duplex responses = %d and capsule events = %d, want two of each", completions, capsuleEvents)
+	}
+	firstRequest, secondRequest := <-requests, <-requests
+	if gjson.GetBytes(firstRequest, "input.2.type").String() != "compaction_trigger" {
+		t.Fatalf("first request did not retain its trigger: %s", firstRequest)
+	}
+	secondInput := gjson.GetBytes(secondRequest, "input")
+	if strings.Contains(string(secondRequest), "cpa-responses-v1-compaction-v1.") {
+		t.Fatalf("queued replay leaked the opaque capsule upstream: %s", secondRequest)
+	}
+	if !strings.Contains(secondInput.Raw, "duplex summary") || !strings.Contains(secondInput.Raw, "Summarize the conversation so far") || gjson.GetBytes(secondRequest, "input.3.type").String() != "compaction_trigger" {
+		t.Fatalf("queued replay lost summary context or trigger: %s", secondRequest)
+	}
+}
+
 func TestCodexWebsocketsV1CompactionDisabledAndNativeOutput(t *testing.T) {
 	for _, testCase := range []struct {
 		name         string

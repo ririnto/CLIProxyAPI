@@ -166,6 +166,13 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 		email = claims.GetUserEmail()
 		planType = claims.GetPlanType()
 	}
+	var compactionKeyring *ResponsesCompactionKeyring
+	if strings.TrimSpace(accountID) != "" {
+		compactionKeyring, err = NewResponsesCompactionKeyring(accountID)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// Create token data
 	tokenData := CodexTokenData{
@@ -180,8 +187,9 @@ func (o *CodexAuth) ExchangeCodeForTokensWithRedirect(ctx context.Context, code,
 
 	// Create auth bundle
 	bundle := &CodexAuthBundle{
-		TokenData:   tokenData,
-		LastRefresh: time.Now().Format(time.RFC3339),
+		TokenData:                  tokenData,
+		LastRefresh:                time.Now().Format(time.RFC3339),
+		ResponsesCompactionKeyring: compactionKeyring,
 	}
 
 	return bundle, nil
@@ -294,14 +302,15 @@ func (o *CodexAuth) CreateTokenStorage(bundle *CodexAuthBundle) *CodexTokenStora
 		planType = strings.TrimSpace(bundle.TokenData.PlanType)
 	}
 	storage := &CodexTokenStorage{
-		IDToken:      bundle.TokenData.IDToken,
-		AccessToken:  bundle.TokenData.AccessToken,
-		RefreshToken: bundle.TokenData.RefreshToken,
-		AccountID:    bundle.TokenData.AccountID,
-		LastRefresh:  bundle.LastRefresh,
-		Email:        bundle.TokenData.Email,
-		Expire:       bundle.TokenData.Expire,
-		PlanType:     planType,
+		IDToken:                    bundle.TokenData.IDToken,
+		AccessToken:                bundle.TokenData.AccessToken,
+		RefreshToken:               bundle.TokenData.RefreshToken,
+		AccountID:                  bundle.TokenData.AccountID,
+		LastRefresh:                bundle.LastRefresh,
+		Email:                      bundle.TokenData.Email,
+		Expire:                     bundle.TokenData.Expire,
+		PlanType:                   planType,
+		ResponsesCompactionKeyring: bundle.ResponsesCompactionKeyring,
 	}
 
 	return storage

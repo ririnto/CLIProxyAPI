@@ -212,6 +212,11 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	if provider == "codex" {
+		if _, hasCompactionKeyring := metadata[codex.ResponsesCompactionKeyringMetadataKey]; hasCompactionKeyring {
+			a.Storage = codex.NewTokenStorageFromMetadata(metadata)
+		}
+	}
 	// Read priority from auth file.
 	coreauth.ApplyAuthPriorityMetadata(a, metadata)
 	if errWeight := coreauth.ApplyAuthWeightMetadata(a, metadata); errWeight != nil {

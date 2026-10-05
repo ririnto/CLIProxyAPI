@@ -13,6 +13,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
@@ -81,6 +82,13 @@ func codexV1CompactionOptions() cliproxyexecutor.Options {
 	return cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse}
 }
 
+func codexV1CompactionAuth(baseURL, id, apiKey string) *cliproxyauth.Auth {
+	auth := codexAPIKeyTestAuth(baseURL)
+	auth.ID = id
+	auth.Attributes["api_key"] = apiKey
+	return auth
+}
+
 func codexV1CompactionSummaryResponse() []byte {
 	return []byte(`{"id":"resp-summary","object":"response","created_at":42,"status":"completed","background":false,"error":null,"model":"summary-model","output":[{"type":"message","id":"msg-summary","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Carry the task context forward."}]}],"usage":{"input_tokens":17,"output_tokens":9,"total_tokens":26,"input_tokens_details":{"cached_tokens":2},"provider_usage":{"kept":true}},"metadata":{"keep":"value"}}`)
 }
@@ -96,29 +104,57 @@ func codexV1CompactionResponseFor(index int) (string, []byte) {
 	return "text/event-stream", codexV1CompactionSSE(codexV1CompactionSummaryResponse())
 }
 
-func TestCodexExecutorV1CompactionReplaysDefaultEndpointAcrossCredentials(t *testing.T) {
+func TestCodexExecutorV1CompactionScopesSelectedAuthAndSurvivesConfigReload(t *testing.T) {
+	const defaultEndpoint = "https://chatgpt.com/backend-api/codex"
 	executor := NewCodexExecutor(&config.Config{CodexKey: []config.CodexKey{
-		{APIKey: "sk-old"},
-		{APIKey: "sk-new", BaseURL: "https://chatgpt.com/backend-api/codex/"},
+		{APIKey: "sk-account-a"},
+		{APIKey: "sk-account-b", BaseURL: defaultEndpoint + "/"},
 		{APIKey: "sk-foreign", BaseURL: "https://other.example/v1"},
 	}})
-	auth := codexAPIKeyTestAuth("")
-	auth.Attributes["api_key"] = "sk-old"
-	scope, secrets := executor.v1CompactionCredentials(auth)
-	response, errConvert := helps.ConvertResponsesCompactionResponse(codexV1CompactionSummaryResponse(), "summary-model", scope, secrets)
+	authA := codexV1CompactionAuth("", "codex-account-a", "sk-account-a")
+	scopeA, secretsA := executor.v1CompactionCredentials(authA)
+	if len(secretsA) != 1 || secretsA[0] != "sk-account-a" {
+		t.Fatalf("selected credentials = %q, want only account A's credential", secretsA)
+	}
+	response, errConvert := helps.ConvertResponsesCompactionResponse(codexV1CompactionSummaryResponse(), "summary-model", scopeA, secretsA)
 	if errConvert != nil {
 		t.Fatal(errConvert)
 	}
 	replay := []byte(`{"input":` + gjson.GetBytes(response, "output").Raw + `}`)
-	auth.Attributes["api_key"] = "sk-new"
-	replayScope, replaySecrets := executor.v1CompactionCredentials(auth)
-	if _, errExpand := helps.ExpandResponsesCompactionCapsules(replay, replayScope, replaySecrets); errExpand != nil {
-		t.Fatalf("default endpoint credential pool could not replay capsule: %v", errExpand)
+	for _, otherAuth := range []*cliproxyauth.Auth{
+		codexV1CompactionAuth("", "codex-account-b", "sk-account-b"),
+		codexV1CompactionAuth("", "codex-account-b", "sk-account-a"),
+		codexV1CompactionAuth(defaultEndpoint, "codex-account-a", "sk-account-b"),
+	} {
+		otherScope, otherSecrets := executor.v1CompactionCredentials(otherAuth)
+		if _, errExpand := helps.ExpandResponsesCompactionCapsules(replay, otherScope, otherSecrets); errExpand == nil {
+			t.Fatalf("account %q with key %q replayed another auth's capsule", otherAuth.ID, otherAuth.Attributes["api_key"])
+		}
 	}
-	executor.cfg.CodexKey = executor.cfg.CodexKey[1:]
-	removedScope, remainingSecrets := executor.v1CompactionCredentials(auth)
-	if _, errExpand := helps.ExpandResponsesCompactionCapsules(replay, removedScope, remainingSecrets); errExpand == nil {
-		t.Fatal("capsule authenticated after its credential was removed")
+	executor.cfg = &config.Config{CodexKey: []config.CodexKey{{APIKey: "sk-account-a", BaseURL: defaultEndpoint + "/"}}}
+	reloadedScope, reloadedSecrets := executor.v1CompactionCredentials(authA)
+	if reloadedScope != scopeA || len(reloadedSecrets) != 1 || reloadedSecrets[0] != "sk-account-a" {
+		t.Fatalf("same-auth config reload changed capsule binding: scope %q, credentials %q", reloadedScope, reloadedSecrets)
+	}
+	if _, errExpand := helps.ExpandResponsesCompactionCapsules(replay, reloadedScope, reloadedSecrets); errExpand != nil {
+		t.Fatalf("same auth could not replay capsule after config reload: %v", errExpand)
+	}
+}
+
+func TestCodexExecutorV1CompactionRejectsMissingAuthBinding(t *testing.T) {
+	executor := NewCodexExecutor(&config.Config{})
+	for _, auth := range []*cliproxyauth.Auth{
+		nil,
+		codexV1CompactionAuth("https://example.com/v1", "", "sk-test"),
+		codexV1CompactionAuth("https://example.com/v1", "codex-account", ""),
+	} {
+		scope, secrets := executor.v1CompactionCredentials(auth)
+		if scope != "" || len(secrets) != 0 {
+			t.Fatalf("missing auth binding produced scope %q and credentials %q", scope, secrets)
+		}
+		if _, errConvert := helps.ConvertResponsesCompactionResponse(codexV1CompactionSummaryResponse(), "summary-model", scope, secrets); errConvert == nil {
+			t.Fatal("compaction capsule was created without a selected auth binding")
+		}
 	}
 }
 
@@ -141,7 +177,7 @@ func TestCodexExecutorV1CompactionUsesResponsesAndReturnsOneCapsule(t *testing.T
 				return "text/event-stream", codexV1CompactionSSE(codexV1CompactionSummaryResponse())
 			})
 			executor := NewCodexExecutor(codexV1CompactionConfig(server.URL, config.CodexModel{Name: "summary-model", Alias: "summary-model", UseV1Compaction: true}))
-			auth := codexAPIKeyTestAuth(server.URL)
+			auth := codexV1CompactionAuth(server.URL, "codex-compaction-test", "sk-test")
 			request := codexV1CompactionRequest()
 			options := codexV1CompactionOptions()
 			var result cliproxyexecutor.Response
@@ -242,7 +278,7 @@ func assertCodexV1CompactionRequest(t *testing.T, body []byte) {
 func TestCodexExecutorV1CompactionExpandsCapsuleBeforeExecuteAndExecuteStream(t *testing.T) {
 	server, capture := newCodexV1CompactionServer(t, codexV1CompactionResponseFor)
 	executor := NewCodexExecutor(codexV1CompactionConfig(server.URL, config.CodexModel{Name: "summary-model", Alias: "summary-model", UseV1Compaction: true}))
-	auth := codexAPIKeyTestAuth(server.URL)
+	auth := codexV1CompactionAuth(server.URL, "codex-compaction-test", "sk-test")
 	first, err := executor.Execute(context.Background(), auth, codexV1CompactionRequest(), codexV1CompactionOptions())
 	if err != nil {
 		t.Fatalf("initial summary Execute error: %v", err)
@@ -313,7 +349,7 @@ func TestCodexExecutorV1CompactionRejectsInvalidCapsuleBeforeUpstream(t *testing
 	executor := NewCodexExecutor(codexV1CompactionConfig(server.URL, config.CodexModel{Name: "summary-model", Alias: "summary-model", UseV1Compaction: true}))
 	request := codexV1CompactionRequest()
 	request.Payload = []byte(`{"input":[{"type":"compaction","encrypted_content":"cpa-responses-v1-compaction-v1.invalid"},{"type":"compaction_trigger","id":"trigger-1"}]}`)
-	if _, err := executor.Execute(context.Background(), codexAPIKeyTestAuth(server.URL), request, codexV1CompactionOptions()); err == nil {
+	if _, err := executor.Execute(context.Background(), codexV1CompactionAuth(server.URL, "codex-compaction-test", "sk-test"), request, codexV1CompactionOptions()); err == nil {
 		t.Fatal("Execute accepted an invalid bridge capsule")
 	}
 	if requests := capture.snapshot(); len(requests) != 0 {
@@ -345,7 +381,7 @@ func TestCodexExecutorV1CompactionRejectsUnfinishedResponses(t *testing.T) {
 				return "text/event-stream", tc.response
 			})
 			executor := NewCodexExecutor(codexV1CompactionConfig(server.URL, config.CodexModel{Name: "summary-model", Alias: "summary-model", UseV1Compaction: true}))
-			if _, err := executor.Execute(context.Background(), codexAPIKeyTestAuth(server.URL), codexV1CompactionRequest(), codexV1CompactionOptions()); err == nil {
+			if _, err := executor.Execute(context.Background(), codexV1CompactionAuth(server.URL, "codex-compaction-test", "sk-test"), codexV1CompactionRequest(), codexV1CompactionOptions()); err == nil {
 				t.Fatal("Execute returned a compaction success for an unfinished response")
 			}
 			if requests := capture.snapshot(); len(requests) != 1 || requests[0].path != "/responses" {
@@ -363,7 +399,7 @@ func TestCodexExecutorV1CompactionAcceptsMultilineSSE(t *testing.T) {
 		return "text/event-stream", response
 	})
 	executor := NewCodexExecutor(codexV1CompactionConfig(server.URL, config.CodexModel{Name: "summary-model", Alias: "summary-model", UseV1Compaction: true}))
-	result, err := executor.Execute(context.Background(), codexAPIKeyTestAuth(server.URL), codexV1CompactionRequest(), codexV1CompactionOptions())
+	result, err := executor.Execute(context.Background(), codexV1CompactionAuth(server.URL, "codex-compaction-test", "sk-test"), codexV1CompactionRequest(), codexV1CompactionOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +426,7 @@ func TestCodexExecutorV1CompactionHonorsDisabledAndAuthoritativeSiblingSettings(
 			executor := NewCodexExecutor(codexV1CompactionConfig(server.URL, tc.models...))
 			request := codexV1CompactionRequest()
 			request.Metadata = tc.metadata
-			response, err := executor.Execute(context.Background(), codexAPIKeyTestAuth(server.URL), request, codexV1CompactionOptions())
+			response, err := executor.Execute(context.Background(), codexV1CompactionAuth(server.URL, "codex-compaction-test", "sk-test"), request, codexV1CompactionOptions())
 			if err != nil {
 				t.Fatalf("Execute error: %v", err)
 			}
@@ -418,7 +454,7 @@ func TestCodexExecutorV1CompactionPreservesNativeCompactionOutput(t *testing.T) 
 	response := []byte(`{"id":"resp-native","object":"response","status":"completed","model":"summary-model","output":[` + native + `],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}`)
 	server, capture := newCodexV1CompactionServer(t, func(int) (string, []byte) { return "application/json", response })
 	executor := NewCodexExecutor(codexV1CompactionConfig(server.URL, config.CodexModel{Name: "summary-model", Alias: "summary-model", UseV1Compaction: true}))
-	result, err := executor.Execute(context.Background(), codexAPIKeyTestAuth(server.URL), codexV1CompactionRequest(), codexV1CompactionOptions())
+	result, err := executor.Execute(context.Background(), codexV1CompactionAuth(server.URL, "codex-compaction-test", "sk-test"), codexV1CompactionRequest(), codexV1CompactionOptions())
 	if err != nil {
 		t.Fatalf("Execute error: %v", err)
 	}
@@ -439,7 +475,7 @@ func TestCodexAutoRequiredUpstreamWebsocketDoesNotFallbackToHTTP(t *testing.T) {
 		return "text/event-stream", codexV1CompactionSSE(codexV1CompactionSummaryResponse())
 	})
 	executor := NewCodexAutoExecutor(codexV1CompactionConfig(server.URL, config.CodexModel{Name: "summary-model", Alias: "summary-model", UseV1Compaction: true}))
-	auth := codexAPIKeyTestAuth(server.URL)
+	auth := codexV1CompactionAuth(server.URL, "codex-compaction-test", "sk-test")
 	ctx := cliproxyexecutor.WithRequiredUpstreamWebsocket(context.Background())
 	if _, err := executor.Execute(ctx, auth, codexV1CompactionRequest(), codexV1CompactionOptions()); !cliproxyexecutor.IsUpstreamWebsocketReplayRequired(err) {
 		t.Fatalf("Execute error = %v, want required-WebSocket replay error", err)

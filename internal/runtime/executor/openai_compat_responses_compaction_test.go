@@ -64,6 +64,7 @@ func TestV1CompactionPreservesUsage(t *testing.T) {
 					} else {
 						executor = NewOpenAICompatExecutor(provider, &config.Config{OpenAICompatibility: []config.OpenAICompatibility{{Name: provider, BaseURL: server.URL, Models: []config.OpenAICompatibilityModel{{Name: "summary-model", Alias: "summary-model", UseV1Compaction: true}}}}})
 					}
+					auth.ID = "v1-compaction-test"
 					opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatOpenAIResponse, Stream: stream}
 					var err error
 					var response cliproxyexecutor.Response
@@ -194,6 +195,53 @@ func TestOpenAICompatV1ResponsesCompactionPreservesTriggerAndReplaysCapsule(t *t
 	}
 	if strings.Contains(string(secondRequest), capsule) {
 		t.Fatalf("proxy-owned capsule was not expanded before forwarding: %s", secondRequest)
+	}
+}
+
+func TestOpenAICompatV1CompactionScopesSelectedAuthAndSurvivesConfigReload(t *testing.T) {
+	const endpoint = "https://provider.example/v1"
+	executor := NewOpenAICompatExecutor("sample", &config.Config{OpenAICompatibility: []config.OpenAICompatibility{{
+		Name:          "sample",
+		BaseURL:       endpoint,
+		APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "sk-account-a"}, {APIKey: "sk-account-b"}},
+	}}})
+	request := cliproxyexecutor.Request{Model: "mock-model"}
+	authA := &cliproxyauth.Auth{ID: "compat-account-a", Provider: "sample", Attributes: map[string]string{"base_url": endpoint, "api_key": "sk-account-a"}}
+	scopeA, secretsA := executor.v1CompactionCredentials(authA, request)
+	if len(secretsA) != 1 || secretsA[0] != "sk-account-a" {
+		t.Fatalf("selected credentials = %q, want only account A's credential", secretsA)
+	}
+	response, errConvert := helps.ConvertResponsesCompactionResponse(codexV1CompactionSummaryResponse(), "mock-model", scopeA, secretsA)
+	if errConvert != nil {
+		t.Fatal(errConvert)
+	}
+	replay := []byte(`{"input":` + gjson.GetBytes(response, "output").Raw + `}`)
+	for _, otherAuth := range []*cliproxyauth.Auth{
+		{ID: "compat-account-b", Provider: "sample", Attributes: map[string]string{"base_url": endpoint, "api_key": "sk-account-b"}},
+		{ID: "compat-account-b", Provider: "sample", Attributes: map[string]string{"base_url": endpoint, "api_key": "sk-account-a"}},
+		{ID: "compat-account-a", Provider: "sample", Attributes: map[string]string{"base_url": endpoint, "api_key": "sk-account-b"}},
+	} {
+		otherScope, otherSecrets := executor.v1CompactionCredentials(otherAuth, request)
+		if _, errExpand := helps.ExpandResponsesCompactionCapsules(replay, otherScope, otherSecrets); errExpand == nil {
+			t.Fatalf("auth %q with key %q replayed another binding's capsule", otherAuth.ID, otherAuth.Attributes["api_key"])
+		}
+	}
+	executor.cfg = &config.Config{OpenAICompatibility: []config.OpenAICompatibility{{
+		Name: "sample", BaseURL: endpoint, APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "sk-account-a"}},
+	}}}
+	reloadedScope, reloadedSecrets := executor.v1CompactionCredentials(authA, request)
+	if reloadedScope != scopeA || len(reloadedSecrets) != 1 || reloadedSecrets[0] != "sk-account-a" {
+		t.Fatalf("same-auth config reload changed capsule binding: scope %q, credentials %q", reloadedScope, reloadedSecrets)
+	}
+	if _, errExpand := helps.ExpandResponsesCompactionCapsules(replay, reloadedScope, reloadedSecrets); errExpand != nil {
+		t.Fatalf("same auth could not replay capsule after config reload: %v", errExpand)
+	}
+	missingScope, missingSecrets := executor.v1CompactionCredentials(nil, request)
+	if missingScope != "" || len(missingSecrets) != 0 {
+		t.Fatalf("missing auth produced scope %q and credentials %q", missingScope, missingSecrets)
+	}
+	if _, errConvert = helps.ConvertResponsesCompactionResponse(codexV1CompactionSummaryResponse(), "mock-model", missingScope, missingSecrets); errConvert == nil {
+		t.Fatal("compaction capsule was created without a selected auth binding")
 	}
 }
 
@@ -710,17 +758,18 @@ func TestOpenAICompatV1ResponsesPayloadRulesAreFinal(t *testing.T) {
 							Filter: []config.PayloadFilterRule{{Models: []config.PayloadModelRule{{Name: "summary-model"}}, Params: []string{"input.0", "prompt_cache_key"}}},
 						}
 					}
+					executor := NewOpenAICompatExecutor("sample", cfg)
+					auth := &cliproxyauth.Auth{ID: "payload-rules-test", Provider: "sample", Attributes: map[string]string{"base_url": server.URL, "api_key": "test-secret"}}
 					item := `{"type":"compaction_trigger","id":"trigger-final"}`
 					if !summary {
-						response, err := helps.ConvertResponsesCompactionResponse(codexV1CompactionSummaryResponse(), "summary-model", "sample\x00"+server.URL, []string{"test-secret"})
+						scope, secrets := executor.v1CompactionCredentials(auth, cliproxyexecutor.Request{Model: "summary-model"})
+						response, err := helps.ConvertResponsesCompactionResponse(codexV1CompactionSummaryResponse(), "summary-model", scope, secrets)
 						if err != nil {
 							t.Fatal(err)
 						}
 						item = gjson.GetBytes(response, "output.1").Raw
 					}
 					payload := []byte(`{"model":"summary-model","prompt_cache_key":"caller-cache","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"remove-first"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"keep-second"}]},` + item + `]}`)
-					executor := NewOpenAICompatExecutor("sample", cfg)
-					auth := &cliproxyauth.Auth{Provider: "sample", Attributes: map[string]string{"base_url": server.URL, "api_key": "test-secret"}}
 					req := cliproxyexecutor.Request{Model: "summary-model", Payload: payload}
 					opts := cliproxyexecutor.Options{Stream: stream, SourceFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: payload}
 					if stream {
@@ -781,7 +830,7 @@ func TestOpenAICompatV1ResponsesPayloadRulesRejectUnsafeSummaryHistory(t *testin
 				Payload:             config.PayloadConfig{Override: []config.PayloadRule{{Models: []config.PayloadModelRule{{Name: "summary-model"}}, Params: map[string]any{"previous_response_id": "resp_server_owned"}}}},
 			}
 			executor := NewOpenAICompatExecutor("sample", cfg)
-			auth := &cliproxyauth.Auth{Provider: "sample", Attributes: map[string]string{"base_url": server.URL, "api_key": "test-secret"}}
+			auth := &cliproxyauth.Auth{ID: "unsafe-summary-test", Provider: "sample", Attributes: map[string]string{"base_url": server.URL, "api_key": "test-secret"}}
 			req := codexV1CompactionRequest()
 			opts := cliproxyexecutor.Options{Stream: stream, SourceFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: req.Payload}
 			var executionError error

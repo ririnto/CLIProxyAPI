@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -65,6 +66,41 @@ func TestRefreshTokens_UsesIndependentTimeout(t *testing.T) {
 
 func resetCodexRefreshGroupForTest() {
 	codexRefreshGroup = singleflight.Group{}
+}
+
+func TestExchangeCodeForTokensCreatesFreshAccountBoundCompactionKeyring(t *testing.T) {
+	idToken := makeTestJWT(map[string]any{
+		"email":                       "user@example.com",
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "account-a"},
+	})
+	auth := &CodexAuth{httpClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, errMarshal := json.Marshal(map[string]any{
+			"access_token":  "access-token",
+			"refresh_token": "refresh-token",
+			"id_token":      idToken,
+			"expires_in":    3600,
+		})
+		if errMarshal != nil {
+			return nil, errMarshal
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(body))), Header: make(http.Header), Request: req}, nil
+	})}}
+	pkce := &PKCECodes{CodeVerifier: "verifier", CodeChallenge: "challenge"}
+	first, errFirst := auth.ExchangeCodeForTokens(context.Background(), "code", pkce)
+	if errFirst != nil {
+		t.Fatal(errFirst)
+	}
+	second, errSecond := auth.ExchangeCodeForTokens(context.Background(), "code", pkce)
+	if errSecond != nil {
+		t.Fatal(errSecond)
+	}
+	if !first.ResponsesCompactionKeyring.ValidForAccount("account-a") || first.ResponsesCompactionKeyring.RootKey == second.ResponsesCompactionKeyring.RootKey {
+		t.Fatal("independent OAuth exchanges did not receive isolated account-bound roots")
+	}
+	storage := auth.CreateTokenStorage(first)
+	if storage.ResponsesCompactionKeyring == nil || storage.ResponsesCompactionKeyring.RootKey != first.ResponsesCompactionKeyring.RootKey {
+		t.Fatal("token storage did not retain the OAuth exchange root")
+	}
 }
 
 func TestRefreshTokensWithRetry_NonRetryableOnlyAttemptsOnce(t *testing.T) {
@@ -302,5 +338,36 @@ func TestCreateAndUpdateTokenStorage_PlanType(t *testing.T) {
 	})
 	if storage.PlanType != "free" {
 		t.Fatalf("updated storage.PlanType = %q, want free", storage.PlanType)
+	}
+}
+
+func TestExchangeCodeForTokensCreatesRootOnlyWithVerifiedAccount(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		accountID string
+		wantRoot  bool
+	}{
+		{name: "verified account", accountID: "account-a", wantRoot: true},
+		{name: "missing account", wantRoot: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idToken := makeTestJWT(map[string]any{"email": "user@example.com", "https://api.openai.com/auth": map[string]any{"chatgpt_account_id": tc.accountID}})
+			auth := &CodexAuth{httpClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body := `{"access_token":"access","refresh_token":"refresh","id_token":"` + idToken + `","token_type":"Bearer","expires_in":3600}`
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header), Request: req}, nil
+			})}}
+			bundle, errExchange := auth.ExchangeCodeForTokensWithRedirect(context.Background(), "code", "https://localhost/callback", &PKCECodes{CodeVerifier: "verifier"})
+			if errExchange != nil {
+				t.Fatalf("ExchangeCodeForTokensWithRedirect error: %v", errExchange)
+			}
+			storage := auth.CreateTokenStorage(bundle)
+			if tc.wantRoot {
+				if bundle.ResponsesCompactionKeyring == nil || !bundle.ResponsesCompactionKeyring.ValidForAccount(tc.accountID) || storage.ResponsesCompactionKeyring.RootKey != bundle.ResponsesCompactionKeyring.RootKey {
+					t.Fatal("authenticated token exchange did not persist its account-bound root")
+				}
+			} else if bundle.ResponsesCompactionKeyring != nil || storage.ResponsesCompactionKeyring != nil {
+				t.Fatal("token exchange without a verified account created a compaction root")
+			}
+		})
 	}
 }

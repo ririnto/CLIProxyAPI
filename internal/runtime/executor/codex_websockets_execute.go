@@ -401,6 +401,9 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketV1Compaction(auth *clipro
 		return req, opts, false, nil
 	}
 	summary := helps.HasResponsesCompactionTrigger(req.Payload)
+	if err := e.v1CompactionCredentialError(auth, req.Payload); err != nil {
+		return req, opts, false, err
+	}
 	scope, secrets := e.v1CompactionCredentials(auth)
 	payload, errExpand := helps.ExpandResponsesCompactionCapsules(req.Payload, scope, secrets)
 	if errExpand != nil {

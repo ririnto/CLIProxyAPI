@@ -37,5 +37,6 @@ type CodexAuthBundle struct {
 	// TokenData contains the OAuth tokens from the authentication flow
 	TokenData CodexTokenData `json:"token_data"`
 	// LastRefresh is the timestamp of the last token refresh
-	LastRefresh string `json:"last_refresh"`
+	LastRefresh                string                      `json:"last_refresh"`
+	ResponsesCompactionKeyring *ResponsesCompactionKeyring `json:"-"`
 }
