@@ -450,7 +450,7 @@ func (e *CodexWebsocketsExecutor) streamCodexDuplex(
 				outputFallback = nil
 			}
 			upstreamEvent := payload
-			summaryCompaction := current.summaryCompaction && helps.HasResponsesCompactionTrigger(current.clientBody)
+			summaryCompaction := current.summaryCompaction && helps.IsPreparedV1CompactionPayload(current.clientBody)
 			deferCompletionEvent := summaryCompaction && (eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete")
 			if deferCompletionEvent && summaryTerminalSeen {
 				errCompaction := helps.ResponsesCompactionError{Message: "compaction upstream returned duplicate terminal events"}

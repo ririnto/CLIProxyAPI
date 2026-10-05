@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -20,8 +21,9 @@ import (
 )
 
 type codexV1CompactionCapturedRequest struct {
-	path string
-	body []byte
+	path   string
+	accept string
+	body   []byte
 }
 
 type codexV1CompactionCapture struct {
@@ -51,7 +53,7 @@ func newCodexV1CompactionServer(t *testing.T, respond func(int) (string, []byte)
 			http.Error(w, "could not read request", http.StatusBadRequest)
 			return
 		}
-		index := capture.add(codexV1CompactionCapturedRequest{path: r.URL.Path, body: body})
+		index := capture.add(codexV1CompactionCapturedRequest{path: r.URL.Path, accept: r.Header.Get("Accept"), body: body})
 		contentType, response := respond(index)
 		w.Header().Set("Content-Type", contentType)
 		_, _ = w.Write(response)
@@ -229,6 +231,65 @@ func TestCodexExecutorV1CompactionUsesResponsesAndReturnsOneCapsule(t *testing.T
 			capsule := output[1].Get("encrypted_content").String()
 			if capsule == "" || strings.Contains(capsule, "Carry the task context forward") {
 				t.Fatalf("capsule is missing or exposes the summary: %q", capsule)
+			}
+		})
+	}
+}
+
+func TestCodexExecutorV1CompactionFinalPayloadCanDisableSummary(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			server, capture := newCodexV1CompactionServer(t, func(int) (string, []byte) {
+				return "text/event-stream", codexV1CompactionSSE(codexV1CompactionSummaryResponse())
+			})
+			cfg := codexV1CompactionConfig(server.URL, config.CodexModel{Name: "summary-model", Alias: "summary-model", UseV1Compaction: true})
+			cfg.Payload.Override = []config.PayloadRule{{
+				Models: []config.PayloadModelRule{{Name: "summary-model"}},
+				Params: map[string]any{
+					"input":                []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "configured ordinary input"}}}},
+					"previous_response_id": "server-owned-history",
+				},
+			}}
+			executor := NewCodexExecutor(cfg)
+			auth := &cliproxyauth.Auth{ID: "codex-oauth-without-compaction-root", Provider: "codex", Attributes: map[string]string{"base_url": server.URL}, Metadata: map[string]any{"type": "codex", "access_token": "oauth-token", "account_id": "acct"}}
+			request := codexV1CompactionRequest()
+			options := codexV1CompactionOptions()
+			options.Stream = stream
+			var responsePayload []byte
+			if stream {
+				result, errStream := executor.ExecuteStream(context.Background(), auth, request, options)
+				if errStream != nil {
+					t.Fatalf("ExecuteStream error: %v", errStream)
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						t.Fatalf("stream chunk error: %v", chunk.Err)
+					}
+					responsePayload = append(responsePayload, chunk.Payload...)
+				}
+			} else {
+				response, errExecute := executor.Execute(context.Background(), auth, request, options)
+				if errExecute != nil {
+					t.Fatalf("Execute error: %v", errExecute)
+				}
+				responsePayload = response.Payload
+			}
+			if strings.Contains(string(responsePayload), "cpa-responses-v1-compaction-v1.") || strings.Contains(string(responsePayload), `"type":"compaction"`) {
+				t.Fatalf("ordinary finalized response was wrapped as a compaction: %s", responsePayload)
+			}
+			requests := capture.snapshot()
+			if len(requests) != 1 {
+				t.Fatalf("upstream request count = %d, want one", len(requests))
+			}
+			body := requests[0].body
+			if gjson.GetBytes(body, "input.0.content.0.text").String() != "configured ordinary input" || gjson.GetBytes(body, "previous_response_id").String() != "server-owned-history" {
+				t.Fatalf("configured ordinary payload was not sent: %s", body)
+			}
+			if strings.Contains(string(body), "compaction_trigger") || strings.Contains(string(body), "Summarize the conversation so far") {
+				t.Fatalf("final ordinary payload retained summary state: %s", body)
+			}
+			if gjson.GetBytes(body, "tools.0.name").String() != "keep-tool" {
+				t.Fatalf("ordinary fallback lost tools removed only for compaction: %s", body)
 			}
 		})
 	}

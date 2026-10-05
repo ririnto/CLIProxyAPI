@@ -848,3 +848,70 @@ func TestOpenAICompatV1ResponsesPayloadRulesRejectUnsafeSummaryHistory(t *testin
 		})
 	}
 }
+
+func TestOpenAICompatV1ResponsesFinalPayloadCanDisableSummary(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			server, capture := newCodexV1CompactionServer(t, func(int) (string, []byte) {
+				return "text/event-stream", codexV1CompactionSSE(codexV1CompactionSummaryResponse())
+			})
+			cfg := &config.Config{
+				OpenAICompatibility: []config.OpenAICompatibility{{Name: "sample", BaseURL: server.URL, Models: []config.OpenAICompatibilityModel{{Name: "summary-model", Alias: "summary-model", UseV1Compaction: true}}}},
+				Payload: config.PayloadConfig{Override: []config.PayloadRule{{
+					Models: []config.PayloadModelRule{{Name: "summary-model"}},
+					Params: map[string]any{
+						"input":                []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "configured ordinary input"}}}},
+						"previous_response_id": "server-owned-history",
+					},
+				}}},
+			}
+			executor := NewOpenAICompatExecutor("sample", cfg)
+			auth := &cliproxyauth.Auth{ID: "compat-final-payload-test", Provider: "sample", Attributes: map[string]string{"base_url": server.URL, "api_key": "test-secret"}}
+			request := codexV1CompactionRequest()
+			options := cliproxyexecutor.Options{Stream: stream, SourceFormat: sdktranslator.FormatOpenAIResponse, ResponseFormat: sdktranslator.FormatOpenAIResponse, OriginalRequest: request.Payload}
+			var responsePayload []byte
+			if stream {
+				result, errStream := executor.ExecuteStream(context.Background(), auth, request, options)
+				if errStream != nil {
+					t.Fatalf("ExecuteStream error: %v", errStream)
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						t.Fatalf("stream chunk error: %v", chunk.Err)
+					}
+					responsePayload = append(responsePayload, chunk.Payload...)
+				}
+			} else {
+				response, errExecute := executor.Execute(context.Background(), auth, request, options)
+				if errExecute != nil {
+					t.Fatalf("Execute error: %v", errExecute)
+				}
+				responsePayload = response.Payload
+			}
+			if strings.Contains(string(responsePayload), "cpa-responses-v1-compaction-v1.") || strings.Contains(string(responsePayload), `"type":"compaction"`) {
+				t.Fatalf("ordinary finalized response was wrapped as a compaction: %s", responsePayload)
+			}
+			requests := capture.snapshot()
+			if len(requests) != 1 {
+				t.Fatalf("upstream request count = %d, want one", len(requests))
+			}
+			wantAccept := "application/json"
+			if stream {
+				wantAccept = "text/event-stream"
+			}
+			if requests[0].accept != wantAccept {
+				t.Fatalf("upstream Accept = %q, want %q", requests[0].accept, wantAccept)
+			}
+			body := requests[0].body
+			if gjson.GetBytes(body, "input.0.content.0.text").String() != "configured ordinary input" || gjson.GetBytes(body, "previous_response_id").String() != "server-owned-history" {
+				t.Fatalf("configured ordinary payload was not sent: %s", body)
+			}
+			if strings.Contains(string(body), "compaction_trigger") || strings.Contains(string(body), "Summarize the conversation so far") {
+				t.Fatalf("final ordinary payload retained summary state: %s", body)
+			}
+			if gjson.GetBytes(body, "tools.0.name").String() != "keep-tool" {
+				t.Fatalf("ordinary fallback lost tools removed only for compaction: %s", body)
+			}
+		})
+	}
+}

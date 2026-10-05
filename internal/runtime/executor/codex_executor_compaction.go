@@ -101,16 +101,13 @@ func hasCodexResponsesCompactionCapsule(payload []byte) bool {
 	return false
 }
 
-func (e *CodexExecutor) prepareV1Compaction(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Request, bool, error) {
+func (e *CodexExecutor) prepareV1Compaction(_ context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Request, bool, error) {
 	if opts.Alt != "" || !e.usesV1Compaction(auth, req, opts) || (opts.SourceFormat != sdktranslator.FormatOpenAIResponse && opts.SourceFormat != sdktranslator.FormatCodex) {
 		return req, false, nil
 	}
 	summary := helps.HasResponsesCompactionTrigger(req.Payload)
-	if err := e.v1CompactionCredentialError(auth, req.Payload); err != nil {
-		return req, false, err
-	}
-	if summary || helps.HasResponsesCompactionItem(req.Payload) {
-		if err := helps.ValidateV1CompactionContext(ctx, req.Payload); err != nil {
+	if hasCodexResponsesCompactionCapsule(req.Payload) {
+		if err := e.v1CompactionCredentialError(auth, req.Payload); err != nil {
 			return req, false, err
 		}
 	}

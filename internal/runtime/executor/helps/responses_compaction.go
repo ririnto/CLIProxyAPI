@@ -91,6 +91,24 @@ func PrepareV1CompactionPayload(payload []byte) []byte {
 	return prepared
 }
 
+// IsPreparedV1CompactionPayload reports whether the finalized input still requests a bridge summary.
+func IsPreparedV1CompactionPayload(payload []byte) bool {
+	if !HasResponsesCompactionTrigger(payload) {
+		return false
+	}
+	for _, item := range gjson.GetBytes(payload, "input").Array() {
+		if item.Get("type").String() != "message" || item.Get("role").String() != "user" {
+			continue
+		}
+		for _, part := range item.Get("content").Array() {
+			if part.Get("type").String() == "input_text" && part.Get("text").String() == responsesV1CompactionInstruction {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func responsesV1CompactionSummaryMessage() json.RawMessage {
 	message, _ := json.Marshal(map[string]any{
 		"type":    "message",

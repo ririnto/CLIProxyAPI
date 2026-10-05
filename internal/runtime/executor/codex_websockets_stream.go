@@ -43,7 +43,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	preserveNativeOutput := prepared.preserveNativeOutput
 	originalPayload := prepared.originalPayload
 	clientBody := prepared.clientBody
-	summaryCompaction := prepared.summaryCompaction && helps.HasResponsesCompactionTrigger(clientBody)
+	summaryCompaction := prepared.summaryCompaction && helps.IsPreparedV1CompactionPayload(clientBody)
 	wsURL := prepared.wsURL
 	wsHeaders := prepared.wsHeaders
 	replayScope := prepared.replayScope
@@ -866,7 +866,9 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 	if errReplay != nil {
 		return nil, errReplay
 	}
-	if summaryCompaction {
+	summaryRequested := summaryCompaction
+	unpreparedBody := bytes.Clone(body)
+	if summaryRequested {
 		body = helps.PrepareV1CompactionPayload(body)
 	}
 
@@ -881,6 +883,20 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketStream(ctx context.Contex
 		return nil, errPromptCache
 	}
 	body = finalizePayload(helps.SanitizeCodexInputItemIDs(body))
+	summaryCompaction = summaryRequested && helps.IsPreparedV1CompactionPayload(body)
+	if summaryRequested && !summaryCompaction {
+		body, wsHeaders, errPromptCache = applyCodexPromptCacheHeadersWithContext(ctx, from, req, unpreparedBody, opts.Headers)
+		if errPromptCache != nil {
+			return nil, errPromptCache
+		}
+		body = finalizePayload(helps.SanitizeCodexInputItemIDs(body))
+		summaryCompaction = summaryRequested && helps.IsPreparedV1CompactionPayload(body)
+	}
+	if summaryCompaction {
+		if errCompaction := e.v1CompactionCredentialError(auth, body); errCompaction != nil {
+			return nil, errCompaction
+		}
+	}
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, preserveNativeOutput, opts.Headers)
 	applyCodexRoutingHint(ctx, wsHeaders, auth, baseModel, body, opts.Headers)
 	applyModelHeaderOverrides(wsHeaders, baseModel)

@@ -159,6 +159,36 @@ func TestCodexWebsocketsV1CompactionReplaysCapsuleOnSameConnection(t *testing.T)
 	}
 }
 
+func TestCodexWebsocketsV1CompactionFinalPayloadCanDisableSummary(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	exec := codexV1WebsocketExecutor(server.URL, true, false)
+	exec.cfg.Payload.Override = []config.PayloadRule{{
+		Models: []config.PayloadModelRule{{Name: "summary-model"}},
+		Params: map[string]any{
+			"input":                []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "configured ordinary input"}}}},
+			"previous_response_id": "server-owned-history",
+		},
+	}}
+	auth := &cliproxyauth.Auth{ID: "ws-oauth-without-compaction-root", Provider: "codex", Attributes: map[string]string{"base_url": server.URL, "websockets": "true"}, Metadata: map[string]any{"type": "codex", "access_token": "oauth-token", "account_id": "acct"}}
+	prepared, errPrepare := exec.prepareCodexWebsocketStream(context.Background(), auth, codexV1WebsocketRequest(), codexV1WebsocketOptions())
+	if errPrepare != nil {
+		t.Fatalf("prepareCodexWebsocketStream error: %v", errPrepare)
+	}
+	if prepared.summaryCompaction {
+		t.Fatal("finalized ordinary request remained classified as a compaction summary")
+	}
+	if gjson.GetBytes(prepared.clientBody, "input.0.content.0.text").String() != "configured ordinary input" || gjson.GetBytes(prepared.clientBody, "previous_response_id").String() != "server-owned-history" {
+		t.Fatalf("configured ordinary payload was not prepared: %s", prepared.clientBody)
+	}
+	if strings.Contains(string(prepared.clientBody), "compaction_trigger") || strings.Contains(string(prepared.clientBody), "Summarize the conversation so far") {
+		t.Fatalf("final ordinary payload retained summary state: %s", prepared.clientBody)
+	}
+	if gjson.GetBytes(prepared.clientBody, "tools.0.name").String() != "keep-tool" {
+		t.Fatalf("ordinary fallback lost tools removed only for compaction: %s", prepared.clientBody)
+	}
+}
+
 func TestCodexWebsocketsV1CompactionStreamAppendsTerminalItemEvents(t *testing.T) {
 	capturedRequest := make(chan []byte, 1)
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}

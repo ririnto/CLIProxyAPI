@@ -75,7 +75,9 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if errReplay != nil {
 		return resp, errReplay
 	}
-	if summaryCompaction {
+	summaryRequested := summaryCompaction
+	unpreparedBody := bytes.Clone(body)
+	if summaryRequested {
 		body = helps.PrepareV1CompactionPayload(body)
 	}
 
@@ -90,6 +92,20 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		return resp, errPromptCache
 	}
 	body = finalizePayload(helps.SanitizeCodexInputItemIDs(body))
+	summaryCompaction = summaryRequested && helps.IsPreparedV1CompactionPayload(body)
+	if summaryRequested && !summaryCompaction {
+		body, wsHeaders, errPromptCache = applyCodexPromptCacheHeadersWithContext(ctx, from, req, unpreparedBody, opts.Headers)
+		if errPromptCache != nil {
+			return resp, errPromptCache
+		}
+		body = finalizePayload(helps.SanitizeCodexInputItemIDs(body))
+		summaryCompaction = summaryRequested && helps.IsPreparedV1CompactionPayload(body)
+	}
+	if summaryCompaction {
+		if errCompaction := e.v1CompactionCredentialError(auth, body); errCompaction != nil {
+			return resp, errCompaction
+		}
+	}
 	reporter.SetTranslatedReasoningEffort(body, to.String())
 	wsHeaders = applyCodexWebsocketHeaders(ctx, wsHeaders, auth, apiKey, e.cfg, nativeRequest, opts.Headers)
 	applyCodexRoutingHint(ctx, wsHeaders, auth, baseModel, body, opts.Headers)
@@ -401,8 +417,10 @@ func (e *CodexWebsocketsExecutor) prepareCodexWebsocketV1Compaction(auth *clipro
 		return req, opts, false, nil
 	}
 	summary := helps.HasResponsesCompactionTrigger(req.Payload)
-	if err := e.v1CompactionCredentialError(auth, req.Payload); err != nil {
-		return req, opts, false, err
+	if hasCodexResponsesCompactionCapsule(req.Payload) {
+		if err := e.v1CompactionCredentialError(auth, req.Payload); err != nil {
+			return req, opts, false, err
+		}
 	}
 	scope, secrets := e.v1CompactionCredentials(auth)
 	payload, errExpand := helps.ExpandResponsesCompactionCapsules(req.Payload, scope, secrets)

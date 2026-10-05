@@ -171,24 +171,24 @@ func (e *OpenAICompatExecutor) openV1Responses(ctx context.Context, auth *clipro
 	finalizePayload := helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts)
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
 	trigger := helps.HasResponsesCompactionTrigger(body)
-	if trigger {
-		for _, payload := range [][]byte{originalPayload, requestPayload, body} {
-			if errValidate := helps.ValidateV1CompactionContext(ctx, payload); errValidate != nil {
-				return nil, nil, errValidate
-			}
-		}
-	}
 	body = helps.SetBoolIfDifferent(body, "stream", downstreamStream || trigger)
 	body = sanitizeOpenAIResponsesReasoningEncryptedContentWithCompat(ctx, "openai compat executor", body, isCompat)
 	body, err = e.applyPromptCacheKey(ctx, auth, from, baseModel, req, opts, body)
 	if err != nil {
 		return nil, nil, err
 	}
+	unpreparedBody := body
 	if trigger {
 		body = helps.PrepareV1CompactionPayload(body)
 	}
 	body = finalizePayload(body)
-	if trigger {
+	summaryCompaction := trigger && helps.IsPreparedV1CompactionPayload(body)
+	if trigger && !summaryCompaction {
+		fallbackBody := helps.SetBoolIfDifferent(unpreparedBody, "stream", downstreamStream)
+		body = finalizePayload(fallbackBody)
+		summaryCompaction = trigger && helps.IsPreparedV1CompactionPayload(body)
+	}
+	if summaryCompaction {
 		if errValidate := helps.ValidateV1CompactionContext(ctx, body); errValidate != nil {
 			return nil, nil, errValidate
 		}
@@ -209,7 +209,7 @@ func (e *OpenAICompatExecutor) openV1Responses(ctx context.Context, auth *clipro
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(httpReq, attrs, opts.Headers)
-	if downstreamStream || trigger {
+	if downstreamStream || summaryCompaction {
 		httpReq.Header.Set("Accept", "text/event-stream")
 		httpReq.Header.Set("Cache-Control", "no-cache")
 	} else {
@@ -256,7 +256,7 @@ func (e *OpenAICompatExecutor) openV1Responses(ctx context.Context, auth *clipro
 		responseFormat: responseFormat,
 		to:             to,
 		body:           body,
-		trigger:        trigger,
+		trigger:        summaryCompaction,
 		reporter:       reporter,
 	}, httpResp, nil
 }

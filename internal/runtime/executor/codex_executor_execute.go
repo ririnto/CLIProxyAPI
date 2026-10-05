@@ -76,7 +76,9 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if errReplay != nil {
 		return resp, errReplay
 	}
-	if summaryCompaction {
+	summaryRequested := summaryCompaction
+	unpreparedBody := bytes.Clone(body)
+	if summaryRequested {
 		body = helps.PrepareV1CompactionPayload(body)
 	}
 	reporter.SetTranslatedReasoningEffort(body, to.String())
@@ -85,6 +87,24 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	httpReq, upstreamBody, err := e.cacheHelper(ctx, from, url, req, body, opts.Headers)
 	if err != nil {
 		return resp, err
+	}
+	summaryCompaction = summaryRequested && helps.IsPreparedV1CompactionPayload(upstreamBody)
+	if summaryRequested && !summaryCompaction {
+		httpReq, upstreamBody, err = e.cacheHelper(ctx, from, url, req, unpreparedBody, opts.Headers)
+		if err != nil {
+			return resp, err
+		}
+		summaryCompaction = summaryRequested && helps.IsPreparedV1CompactionPayload(upstreamBody)
+	}
+	if summaryCompaction {
+		if errCompaction := e.v1CompactionCredentialError(auth, upstreamBody); errCompaction != nil {
+			return resp, errCompaction
+		}
+		for _, payload := range [][]byte{req.Payload, upstreamBody} {
+			if errContext := helps.ValidateV1CompactionContext(ctx, payload); errContext != nil {
+				return resp, errContext
+			}
+		}
 	}
 	applyCodexHeaders(httpReq, auth, apiKey, true, e.cfg, opts.Headers)
 	applyCodexRoutingHint(ctx, httpReq.Header, auth, baseModel, upstreamBody, opts.Headers)
